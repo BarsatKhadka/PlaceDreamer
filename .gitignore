@@ -1,0 +1,7 @@
+# The single source of truth is plan.md. Everything below is local working
+# material — regenerable, large, or reference — and is intentionally untracked.
+papers/
+data_gen/
+picorv32/runs/
+**/__pycache__/
+*.log
