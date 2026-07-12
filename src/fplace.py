@@ -22,7 +22,9 @@ from torch.nn import Sequential as Seq, Linear, ReLU, LeakyReLU
 from torch_geometric.nn import SimpleConv
 from torch_geometric.utils import scatter, dropout_edge
 
-ROOT  = "/Users/barsat/PlaceDreamer"
+# repo-relative so the same code runs on the laptop and on the cluster.
+# override with PD_ROOT=/path/to/repo if the cache lives elsewhere (e.g. scratch).
+ROOT  = os.environ.get("PD_ROOT", os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 CACHE = f"{ROOT}/cache/graphs"
 N_TYPES = 5293
 _META = _NORM = None
