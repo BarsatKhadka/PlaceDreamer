@@ -1,0 +1,22 @@
+# PlaceDreamer — HPC (training-only) dependencies.
+#
+# Use this on the cluster, NOT requirements.txt.
+#
+# Why separate:
+#   * The cluster runs Python 3.13. The pins in requirements.txt (numpy==2.0.2,
+#     scipy==1.13.1) predate cp313 wheels, so pip tries to BUILD scipy from source
+#     and dies on a missing OpenBLAS. Unpinned = pip grabs a prebuilt cp313 wheel.
+#   * Training reads the PREBUILT cache (cache/graphs/*.npz + meta.parquet). It never
+#     builds a graph, so it does NOT need pymetis / networkx / scikit-learn — pymetis
+#     is a C++ source build that would be the next thing to fail here.
+#
+# torch is deliberately NOT listed: install it FIRST, from the CUDA-matched index,
+# or you silently get a CPU-only wheel:
+#     pip install torch --index-url https://download.pytorch.org/whl/cu128
+
+numpy
+scipy          # only scipy.stats.pearsonr (within-design r)
+pandas         # cache/meta.parquet
+pyarrow        # parquet engine
+torch_geometric  # SimpleConv / SAGEConv / GATv2Conv / scatter / dropout_edge
+gdown          # pull the cache tarball from Google Drive

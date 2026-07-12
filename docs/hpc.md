@@ -51,12 +51,13 @@ python -c "import torch; print(torch.__version__, '| cuda build:', torch.version
 #       That is EXPECTED and not an error. Only `torch.version.cuda` matters here;
 #       is_available() is checked for real on a compute node in step 2a.
 
-# 4. the rest
-pip install -r requirements.txt
-pip install torch_geometric                    # PyG (pure python, no CUDA build needed)
+# 4. the rest — ⚠️ requirements-HPC.txt, NOT requirements.txt
+#    (requirements.txt pins numpy/scipy to versions with no cp313 wheels → pip tries to
+#     build scipy from source → dies on missing OpenBLAS. And pymetis, a C++ source build,
+#     is only needed to BUILD graphs — the cache is already built, so HPC doesn't need it.)
+pip install -r requirements-hpc.txt
 
 # 5. get the cache (login node has internet)
-pip install -U gdown
 gdown 1eCi7g7alV9aHFy2hMXGsXip-KPIakS97 -O placedreamer_cache.tar.gz   # ~1.0 GB, a few min
 tar xzf placedreamer_cache.tar.gz              # → cache/graphs/, cache/meta.parquet, cache/norm.npz
 rm placedreamer_cache.tar.gz
@@ -133,6 +134,10 @@ OOD designs (**never trained on, never tuned on**): `jpeg` (largest → size ext
 | raw EDA-Schema sky130hd | 71 GB | **do NOT move it** — the cache already has everything |
 
 ## Gotchas (learned the hard way)
+- **Use `requirements-hpc.txt` on the cluster, never `requirements.txt`.** The cluster is
+  Python 3.13; the local pins (numpy 2.0.2 / scipy 1.13.1) have no cp313 wheels, so pip
+  source-builds scipy and fails with `Dependency "OpenBLAS" not found`. The HPC file is
+  unpinned and drops the build-only deps (pymetis/networkx/sklearn).
 - **`torch.cuda.is_available()` is False on the LOGIN NODE — that's normal, it has no GPU.**
   On the login node check `torch.version.cuda` instead (must be `12.8`, not `None`).
   Check `is_available()` only inside an `srun`/`sbatch` job.

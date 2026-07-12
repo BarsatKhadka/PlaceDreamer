@@ -1,4 +1,10 @@
-# PlaceDreamer — Python dependencies
+# PlaceDreamer — LOCAL (laptop) dependencies: graph BUILDING + caching.
+#
+# ⚠️ Do NOT use this on the cluster — use requirements-hpc.txt instead.
+#    These pins are for the local Python 3.9 env. The cluster is Python 3.13, where
+#    numpy==2.0.2 / scipy==1.13.1 have no wheels and pip tries a source build that
+#    fails on missing OpenBLAS. Training doesn't need pymetis/networkx/sklearn anyway.
+#
 # Pure-Python / data / CPU deps — safe to pip install directly (pinned to what we developed on).
 numpy==2.0.2
 scipy==1.13.1
