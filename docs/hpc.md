@@ -17,10 +17,14 @@ git push origin main          # cache/, datasets/, venv/, *.tar.gz are all gitig
 The tarball is already built: **`placedreamer_cache.tar.gz` (970 MB)**.
 (To rebuild: `tar czf placedreamer_cache.tar.gz cache/graphs cache/meta.parquet cache/norm.npz`)
 
-1. Open **drive.google.com** → upload `placedreamer_cache.tar.gz`
-2. Right-click it → **Share** → **Anyone with the link** → Copy link
-3. The link looks like `https://drive.google.com/file/d/**1AbC...XyZ**/view?usp=sharing`
-   → **the bold part is the FILE_ID.** Save it.
+**Already uploaded + verified public** (gdown pulls it with no auth prompt):
+
+```
+FILE_ID = 1eCi7g7alV9aHFy2hMXGsXip-KPIakS97
+```
+
+(If you ever re-upload: Drive → Share → **Anyone with the link** → the FILE_ID is the segment
+between `/d/` and `/view` in the URL.)
 
 ---
 
@@ -46,7 +50,8 @@ pip install -r requirements.txt
 pip install torch_geometric                    # PyG (pure python, no CUDA build needed)
 
 # 5. get the cache (login node has internet)
-gdown <FILE_ID> -O placedreamer_cache.tar.gz   # the FILE_ID from step 0b
+pip install -U gdown
+gdown 1eCi7g7alV9aHFy2hMXGsXip-KPIakS97 -O placedreamer_cache.tar.gz   # ~1.0 GB, a few min
 tar xzf placedreamer_cache.tar.gz              # → cache/graphs/, cache/meta.parquet, cache/norm.npz
 rm placedreamer_cache.tar.gz
 
@@ -55,10 +60,9 @@ ls cache/graphs/*.npz | wc -l                  # must be 1944
 python -c "import pandas as pd; m=pd.read_parquet('cache/meta.parquet'); print(len(m),'flows'); print(m.columns.tolist())"
 ```
 
-**If `gdown` fails on the big file** (Drive virus-scan interstitial), use:
+**If `gdown` fails on the big file** (older versions choke on Drive's confirm token), use:
 ```bash
-gdown --fuzzy "https://drive.google.com/file/d/<FILE_ID>/view"
-# or:  pip install -U gdown   (older versions choke on the confirm token)
+gdown --fuzzy "https://drive.google.com/file/d/1eCi7g7alV9aHFy2hMXGsXip-KPIakS97/view"
 ```
 
 ---
