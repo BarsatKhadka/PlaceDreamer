@@ -28,9 +28,10 @@ from fplace import FPlace, load_graph, loss_fn, gnll, meta, CACHE
 E = os.environ.get
 DEV     = "cuda" if torch.cuda.is_available() else "cpu"
 ENCODER = E("ENCODER", "dehnn")
-EPOCHS  = int(E("EPOCHS", 30)); LR = float(E("LR", 1e-3))
+EPOCHS  = int(E("EPOCHS", 200)); LR = float(E("LR", 1e-3))
 DIM     = int(E("DIM", 64));    LAYERS = int(E("LAYERS", 4))
 ACCUM   = int(E("ACCUM", 8));   SEED = int(E("SEED", 0))
+PATIENCE = int(E("PATIENCE", 25))   # epochs w/o val improvement before stopping
 OUT     = E("OUT", f"runs/{ENCODER}")
 W = dict(net_hpwl=float(E("W_NETHPWL",1)), net_dem=float(E("W_NETDEM",1)),
          tot_hpwl=float(E("W_TOT",1)), buf_area=float(E("W_BUFA",1)), buf_cnt=float(E("W_BUFC",1)))
@@ -116,6 +117,9 @@ def run_fold(fi, test_designs, all_designs):
 
     model = FPlace(d=DIM, K=LAYERS, encoder=ENCODER).to(DEV)
     opt = torch.optim.Adam(model.parameters(), lr=LR)
+    # long runs plateau; halve the LR when val stalls, floor at 1e-5.
+    sched = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        opt, mode="min", factor=0.5, patience=max(3, PATIENCE // 3), min_lr=1e-5)
     best, best_state, patience = 1e9, None, 0
     for ep in range(EPOCHS):
         model.train(); rng.shuffle(tr); t0=time.time(); tot=0.0
@@ -134,12 +138,16 @@ def run_fold(fi, test_designs, all_designs):
             for f in val:
                 g = load_graph(f, DEV); vl += wloss(model(g), g).item()
         vl /= max(1,len(val))
-        print(f"  ep {ep:3d}  train {tot/len(tr):.4f}  val {vl:.4f}  ({time.time()-t0:.0f}s)", flush=True)
+        sched.step(vl)
+        lr_now = opt.param_groups[0]["lr"]
+        print(f"  ep {ep:3d}  train {tot/len(tr):.4f}  val {vl:.4f}  lr {lr_now:.2e}  "
+              f"({time.time()-t0:.0f}s)", flush=True)
         if vl < best - 1e-4:
             best, best_state, patience = vl, {k:v.detach().cpu().clone() for k,v in model.state_dict().items()}, 0
         else:
             patience += 1
-            if patience >= 5: print("  early stop"); break
+            if patience >= PATIENCE:
+                print(f"  early stop (no val improvement in {PATIENCE} epochs)"); break
     if best_state: model.load_state_dict(best_state)
     torch.save(model.state_dict(), f"{OUT}/fold{fi}.pt")
     res = evaluate(model, te)
@@ -169,20 +177,42 @@ def eval_ood():
     json.dump(allres, open(f"{OUT}/ood_results.json","w"), indent=2)
     print(f"\nwrote {OUT}/ood_results.json")
 
+def aggregate():
+    """Combine per-fold results (written by parallel array tasks) into one CV number."""
+    out = []
+    for f in sorted(glob.glob(f"{OUT}/results_fold*.json")):
+        out += json.load(open(f))
+    if not out:
+        print(f"no {OUT}/results_fold*.json yet — folds still running?"); return
+    print(f"\n=== AGGREGATE across {len(out)} folds (unseen designs) — {OUT} ===")
+    for k in ("net_hpwl","net_dem","tot_hpwl","buf_area","buf_cnt"):
+        r2 = [f["metrics"][k]["r2"] for f in out if k in f["metrics"]]
+        wr = [f["metrics"][k]["within_r"] for f in out
+              if k in f["metrics"] and "within_r" in f["metrics"][k]]
+        if r2:
+            line = f"  {k:10} R² = {np.mean(r2):6.3f} ± {np.std(r2):.3f}"
+            if wr: line += f"   within-design r = {np.nanmean(wr):.3f}"
+            print(line)
+    json.dump(out, open(f"{OUT}/results.json","w"), indent=2)
+    print(f"\nwrote {OUT}/results.json")
+
 if __name__ == "__main__":
     dev, folds = make_folds()
     if "--eval-ood" in sys.argv:
         eval_ood(); sys.exit(0)
+    if "--aggregate" in sys.argv:
+        aggregate(); sys.exit(0)
     which = E("FOLD","all")
     sel = range(len(folds)) if which=="all" else [int(which)]
-    print(f"device={DEV} encoder={ENCODER} dim={DIM} layers={LAYERS} lr={LR} epochs={EPOCHS}")
+    print(f"device={DEV} encoder={ENCODER} dim={DIM} layers={LAYERS} lr={LR} "
+          f"epochs={EPOCHS} patience={PATIENCE}")
+    print(f"loss weights: {W}")
     print(f"LOCKED OOD (excluded from everything): {OOD_DESIGNS}")
     print(f"{len(dev)} dev designs → {len(folds)} CV folds: {folds}")
     out = [run_fold(i, folds[i], dev) for i in sel]
-    json.dump(out, open(f"{OUT}/results.json","w"), indent=2)
-    # aggregate
-    print("\n=== AGGREGATE across folds (unseen designs) ===")
-    for k in ("net_hpwl","net_dem","tot_hpwl","buf_area","buf_cnt"):
-        r2 = [f["metrics"][k]["r2"] for f in out if k in f["metrics"]]
-        if r2: print(f"  {k:10} R² = {np.mean(r2):.3f} ± {np.std(r2):.3f}")
-    print(f"\nwrote {OUT}/results.json")
+    # per-fold file: parallel array tasks must not clobber each other
+    tag = which if which != "all" else "all"
+    json.dump(out, open(f"{OUT}/results_fold{tag}.json","w"), indent=2)
+    print(f"\nwrote {OUT}/results_fold{tag}.json")
+    if which == "all":
+        aggregate()
