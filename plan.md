@@ -1,131 +1,139 @@
 # PlaceDreamer
 
-*Living plan — we keep editing and refining this.*
+*Living plan — simple and honest. We keep editing this.*
 
 ---
 
-## 1. The idea
+## 1. The whole thing in one picture
 
-A **world model predicts the next state of the world.** Here the "world" is the
-chip-design flow, and we want to imagine it forward — **placement → CTS →
-routing** — and give the final answer, all **without running OpenROAD**.
+An **agent picks flow knobs stage by stage**. Between its choices, a **learned world
+model imagines what the flow would produce** — imagine placement, then imagine
+routing — and predicts **PPA**, in milliseconds, without running OpenROAD. The agent
+tries thousands of knob choices this way and keeps the good ones. During training it
+**runs real OpenROAD sometimes** (where the model is unsure) to keep the model honest.
 
 ```
-floorplan ──▶ imagine placement ──▶ imagine CTS ──▶ imagine routing ──▶ answer
-                        (no OpenROAD — just the learned model)
+agent ── picks knobs ──►  floorplan ─[f_place]─► placement ─[f_route]─► routing → PPA
+  ▲         (action)                 (imagine)             (imagine)        │
+  │                                                                        │
+  └──── plans over 1000s of knob choices in seconds (imagination) ─────────┘
+  └──── runs real OpenROAD when unsure → adds data → retrains (grounding)
 ```
 
-If a stage turns out to need more intermediate steps to predict well, we add them.
-Start minimal.
-
-First we **validate that we can learn this flow on a single config** — one design,
-fixed settings — i.e. just predict the chain accurately. Once that works, we put a
-**planner on top**: it chooses different knobs at each stage, imagines the
-outcomes, and picks the best. The learned flow comes first; the planner is the
-eventual goal.
+CTS is a later stage. Start with **floorplan → placement → routing**.
 
 ---
 
-## 2. A note on MBPO
+## 2. The three pieces
 
-MBPO (Janner et al. 2019) is about using a learned model to plan. Two lessons we
-take from it:
-
-- **Don't trust long imagined rollouts** — errors compound. Imagine **short hops
-  from real states**, and re-anchor with real runs now and then. Ensembles help.
-- **A planner against a bad model gets exploited** — it finds knobs the model
-  loves but reality punishes. So: **learn a trustworthy flow first, plan later.**
-
-That's the whole reason we validate the learned flow before adding the planner.
+1. **World model** = two stacked nets (the learned environment):
+   - `f_place`: floorplan + placement knobs → **placement state** (RUDY / density maps, HPWL)
+   - `f_route`: placement state + routing knobs → **routing outcome + PPA** (WNS, power, added buffers, routed WL, DRC)
+   - later: `f_cts` for the clock tree.
+2. **Agent (policy)** = picks knobs **stage by stage**, planning against the world model.
+3. **Grounding loop** = run real OpenROAD where the model is uncertain → add rows → retrain (MBPO / Dyna style).
 
 ---
 
-## 3. The staged flow (how we imagine)
+## 3. Why this is actually a world model (not just two predictors)
 
-How it works, concretely:
+Two stacked predictors alone = a surrogate. It becomes a **world model** because an
+**agent acts on it and plans inside it**:
 
-1. Feed **floorplan features + placement knobs** → **imagine placement**.
-2. Choose **CTS knobs** → **imagine CTS**.
-3. Choose **routing knobs** → **imagine routing** → **final answer** (WL, DRC, slack).
+- The agent **acts** (picks knobs) and **imagines rollouts** (knobs → placement → routing → PPA) in seconds.
+- **Stage-by-stage** actions mean the agent acts *inside* the rollout (floorplan → pick → placement → pick → routing) — a real multi-step MDP, not one-shot config→PPA.
+- The intermediate **placement is a real, inspectable state** — we can look at the imagined RUDY map, and swap in a real placement to continue.
+- It's **anchored to reality** by the grounding loop.
 
-The knobs at each stage are inputs. **For now we give them; eventually the model /
-planner chooses them.** Each imagined state feeds the next stage. That's it — we
-haven't designed beyond this yet.
-
----
-
-## 4. Cheap proxies in the middle (to guide the imagination)
-
-Partway through, the flow can compute cheap estimates *without* finishing. We use
-these to guide/condition the imagination (as inputs, not as the answer):
-
-- **HPWL** — half-perimeter wirelength. A cheap wirelength guess: sum of each net's
-  bounding-box half-perimeter. Underestimates real routed wire.
-- **RUDY** — rectangular uniform wire density. A cheap congestion guess: each net's
-  wire smeared over its bounding box, summed per tile → where routing will be
-  crowded, before routing.
-- **GRWL** — global-route wirelength. A truer wirelength once *global* route runs
-  (still cheaper than full routing). Observed: `routed ≈ 0.727 × GRWL`.
-
-The model predicts the true outcome on top of these guides.
+This is model-based RL. Maps 1:1 to the reading: **Dreamer** (train a policy by imagining
+in a learned model), **MBPO** (ground where unsure), **FastTuner** (RL over PD knobs on a
+learned PPA estimator).
 
 ---
 
-## 5. Features
+## 4. Architecture — borrowed, not invented
 
-*(To be filled in.)*
+Predicting routing from placement is a solved problem. We reuse it:
 
-- **Floorplan:** die size, utilization, aspect ratio, IO, netlist graph — TBD
-- **Placement:** RUDY map, density map, pin map, HPWL — extracted today
-- **CTS:** TBD
-- **Routing:** TBD
-- **Netlist graph:** TBD (not built yet — needed for cross-design)
+- **`f_route`** (placement → routing/PPA): **MAGNet-style scatter/gather** — netlist GNN ⊗
+  placement CNN/U-Net, coupled by projecting the graph onto the grid. Take **Lay-Net's
+  features** (MacroMargin, net-to-net bbox-overlap edges) and the **CircuitNet channel set**
+  (RUDY long/short/pin, cell density, pin density).
+- **Netlist representation**: **DE-HNN** (directed hypergraph + virtual nodes + Laplacian PE).
+- **`f_place`** (netlist + knobs → placement stats): **DE-HNN / Net²-style** netlist→congestion
+  prediction — the "imagine placement" hop.
+- **Agent + grounding**: model-based RL — **FastTuner** is the closest prior; **MBPO** for the
+  grounding discipline; **Dreamer** for policy-in-imagination.
 
----
-
-## 6. Data generation
-
-We build training data by running the **real OpenROAD flow** (via LibreLane) and
-logging what actually happens.
-
-- **Generator:** `data_gen/sweep.py`, adapted from CTS-Bench's
-  `1-gen-placement.py`. It runs the full flow with **randomized knobs** (core util,
-  aspect ratio, target density, synthesis strategy, routability/timing-driven),
-  then extracts placement features and parses routing labels into `dataset.jsonl`
-  (one row per run).
-- **Real OpenROAD:** every row is a real, completed flow — real placement, real
-  routing, real DRC / WL / slack. That is the ground truth the world model learns
-  to imagine.
-- **Status:** 39 rows so far, all picorv32 (single design) — currently validating
-  the learned flow on one design. Note: *total* routed WL is mostly determined by
-  the config/gate-count, so it's an easy target; the interesting signal is spatial
-  (congestion/DRC), which is what the placement actually decides.
+Papers in `papers/routing_pred/` and `papers/`.
 
 ---
 
-## 7. Architecture (what I envision)
+## 5. What's actually novel (be honest)
 
-Keep it simple.
+The nets are borrowed. The contribution is:
 
-The netlist is a **graph** (cells connected by nets). Placement puts each cell at
-an **(x,y) on a grid**. So the object is a **graph on a grid.**
+- **Staged, inspectable world model** — floorplan→placement→routing with a *visible*
+  intermediate placement (FastTuner uses one flat PPA estimator; we imagine the stages).
+- **Stage-wise actions** — the agent picks knobs *between* imagined stages (real MDP).
+- **The composition / compounding problem** ← the real research question. Every routing
+  predictor (MAGNet, Lay-Net, RouteNet) is trained and tested on **real** placements.
+  Feeding `f_route` an **imagined** placement from `f_place` is out-of-distribution and
+  **nobody studies this.** Making the stack hold — and measuring how much imagination
+  degrades vs. real placement — is the MBPO error-compounding problem applied to EDA.
+- **Active grounding** — deciding when to spend a real OpenROAD run.
 
-Two operations connect the two:
+Honest risk: this overlaps FastTuner. The delta must be the **staged model + stage-wise
+actions + composition** — not "RL for DSE," which they already did.
 
-- **Scatter:** spread each net's demand onto the grid tiles its cells cover — this
-  *is* RUDY.
-- **Gather:** read each tile's value back to the cells sitting there.
+---
 
-The model, a few rounds of:
+## 6. Targets = PPA
 
-1. pass messages on the **graph** (cells talk along their nets),
-2. **scatter** onto the grid (seed it with RUDY),
-3. pass messages on the **grid** (neighboring tiles talk — congestion spreads),
-4. **gather** back to the cells.
+Predict **P**ower / **P**erformance (WNS/TNS/slack) / **A**rea (emergent buffering the flow
+adds) + routed WL + DRC. Die/core area are **inputs** (we set them), not targets. Full
+list and metric keys in **`docs/features.md`**.
 
-Output: predict the true congestion/routing as **RUDY + a learned correction**,
-plus per-net numbers (routed length, slack). The same block is reused at each
-stage of the flow.
+---
 
-Details — graph type, grid resolution, number of rounds — get filled in as we
-build and test against simple baselines.
+## 7. Features
+
+Three groups (details in `docs/features.md`):
+- **Config knobs** — the agent's action (util, density, aspect, synth, routability, clock).
+- **Design-intrinsic** — the netlist graph (DE-HNN rep) + scalars; the cross-design backbone.
+- **Placement-state** — RUDY/density/pin maps (upgrade to the CircuitNet decomposed channel set).
+
+---
+
+## 8. Data
+
+- **Seed data (now):** `data_gen/sweep_multi.py` — multi-design sweep, ~600 runs across 11
+  mid-size designs, randomized knobs. Archives per config: netlist (`synth.v`) +
+  `placement.odb` + `routed.def` + `metrics.json` + RUDY maps, then deletes the bulky run.
+  This trains the first world model. (`docs/designs.md` — 20 designs routed & verified.)
+- **Pretraining:** **CircuitNet 2.0** (10k+ samples, all feature maps) for the perception —
+  our sweep is too small alone for a GNN+CNN.
+- **Later:** the **grounding loop** decides which real runs to do — active learning. We never
+  train on the model's own imagined outputs (circular); only on real, actively-chosen runs.
+
+---
+
+## 9. Build order
+
+1. **`f_route`** — real placement → routing/PPA (MAGNet-style). Validate cross-design
+   (**leave-one-design-out**). Proven, tractable.
+2. **`f_place`** — netlist + knobs → placement stats (DE-HNN-style). The hard/novel hop.
+3. **Compose** `f_place → f_route`; measure how much the imagined placement degrades the
+   routing prediction (the **compounding test** — the core experiment).
+4. **Agent** (stage-wise knob picking) + **grounding loop**.
+5. **CTS** stage.
+
+---
+
+## 10. Status
+
+- ✅ 20 designs routed, stable env, macro recipe (`docs/designs.md`).
+- ✅ Features + targets pinned (`docs/features.md`).
+- ✅ Seed sweep running (~19% of 600).
+- ✅ Literature surveyed; papers pulled; architecture direction set.
+- ⬜ `f_route` → `f_place` → compose/compounding test → agent → CTS.

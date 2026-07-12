@@ -2,6 +2,10 @@
 # material — regenerable, large, or reference — and is intentionally untracked.
 papers/
 data_gen/
+rtl/
+picorv32/
 picorv32/runs/
 **/__pycache__/
 *.log
+paperCodes/
+datasets/
