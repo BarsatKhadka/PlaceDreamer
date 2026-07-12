@@ -41,9 +41,15 @@ module load python/2025.12-2
 module load cuda12.8/toolkit/12.8.1
 python -m venv venv && source venv/bin/activate
 
-# 3. ⚠️ CUDA-matched torch FIRST (default PyPI torch silently runs on CPU here!)
+# 3. ⚠️ CUDA-matched torch FIRST (the default PyPI wheel is CPU-only and trains silently on CPU!)
 pip install torch --index-url https://download.pytorch.org/whl/cu128
-python -c "import torch; print('cuda visible:', torch.cuda.is_available())"   # MUST print True
+python -c "import torch; print(torch.__version__, '| cuda build:', torch.version.cuda)"
+#   want:  2.x.x+cu128 | cuda build: 12.8     → correct wheel
+#   bad:   2.x.x+cpu   | cuda build: None     → CPU-only, reinstall with the line above
+#
+# NOTE: torch.cuda.is_available() is **False on the login node** — it has no GPU.
+#       That is EXPECTED and not an error. Only `torch.version.cuda` matters here;
+#       is_available() is checked for real on a compute node in step 2a.
 
 # 4. the rest
 pip install -r requirements.txt
@@ -73,6 +79,11 @@ gdown --fuzzy "https://drive.google.com/file/d/1eCi7g7alV9aHFy2hMXGsXip-KPIakS97
 ```bash
 srun --partition=gpuq --gres=gpu:1 --mem=32G --time=00:20:00 --pty bash
 source venv/bin/activate
+
+# THIS is where CUDA must really be visible (login node has no GPU — False there is fine):
+python -c "import torch; print(torch.cuda.is_available(), torch.cuda.get_device_name(0))"
+#   must print:  True NVIDIA L40S
+
 FOLD=0 EPOCHS=1 python src/train_fplace.py     # one fold, one epoch — does it run on GPU?
 exit
 ```
@@ -122,6 +133,9 @@ OOD designs (**never trained on, never tuned on**): `jpeg` (largest → size ext
 | raw EDA-Schema sky130hd | 71 GB | **do NOT move it** — the cache already has everything |
 
 ## Gotchas (learned the hard way)
+- **`torch.cuda.is_available()` is False on the LOGIN NODE — that's normal, it has no GPU.**
+  On the login node check `torch.version.cuda` instead (must be `12.8`, not `None`).
+  Check `is_available()` only inside an `srun`/`sbatch` job.
 - **torch must come from the cu128 index** or it silently trains on CPU. The sbatch has a hard
   `assert torch.cuda.is_available()` so it fails loudly instead.
 - `--exclude=node049` (bad ECC), same as MechRL.
