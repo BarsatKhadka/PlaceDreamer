@@ -31,7 +31,7 @@ ENCODER = E("ENCODER", "dehnn")
 EPOCHS  = int(E("EPOCHS", 200)); LR = float(E("LR", 1e-3))
 DIM     = int(E("DIM", 64));    LAYERS = int(E("LAYERS", 4))
 ACCUM   = int(E("ACCUM", 8));   SEED = int(E("SEED", 0))
-PATIENCE = int(E("PATIENCE", 25))   # epochs w/o val improvement before stopping
+PATIENCE = int(E("PATIENCE", 0))    # 0 = no early stopping, train all EPOCHS (set >0 to enable)
 OUT     = E("OUT", f"runs/{ENCODER}")
 W = dict(net_hpwl=float(E("W_NETHPWL",1)), net_dem=float(E("W_NETDEM",1)),
          tot_hpwl=float(E("W_TOT",1)), buf_area=float(E("W_BUFA",1)), buf_cnt=float(E("W_BUFC",1)))
@@ -119,8 +119,8 @@ def run_fold(fi, test_designs, all_designs):
     opt = torch.optim.Adam(model.parameters(), lr=LR)
     # long runs plateau; halve the LR when val stalls, floor at 1e-5.
     sched = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        opt, mode="min", factor=0.5, patience=max(3, PATIENCE // 3), min_lr=1e-5)
-    best, best_state, patience = 1e9, None, 0
+        opt, mode="min", factor=0.5, patience=10, min_lr=1e-5)
+    best, best_state, patience = 1e9, None, 0   # we always KEEP the best-val checkpoint
     for ep in range(EPOCHS):
         model.train(); rng.shuffle(tr); t0=time.time(); tot=0.0
         opt.zero_grad()
@@ -146,8 +146,9 @@ def run_fold(fi, test_designs, all_designs):
             best, best_state, patience = vl, {k:v.detach().cpu().clone() for k,v in model.state_dict().items()}, 0
         else:
             patience += 1
-            if patience >= PATIENCE:
+            if PATIENCE and patience >= PATIENCE:      # disabled by default (PATIENCE=0)
                 print(f"  early stop (no val improvement in {PATIENCE} epochs)"); break
+    print(f"  done — best val {best:.4f}; restoring best checkpoint", flush=True)
     if best_state: model.load_state_dict(best_state)
     torch.save(model.state_dict(), f"{OUT}/fold{fi}.pt")
     res = evaluate(model, te)

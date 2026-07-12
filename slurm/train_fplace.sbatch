@@ -22,7 +22,8 @@
 # Env-var knobs (all optional):
 #   FOLD=0|1|2|all     override the array's fold (default: $SLURM_ARRAY_TASK_ID)
 #   ENCODER=dehnn|dehnn_novn|dehnn_undirected|sage|gat  ablation    (default dehnn)
-#   EPOCHS=200  PATIENCE=25  LR=1e-3  DIM=64  LAYERS=4  ACCUM=8  SEED=0
+#   EPOCHS=200  LR=1e-3  DIM=64  LAYERS=4  ACCUM=8  SEED=0
+#   PATIENCE=0         early stopping OFF (default) — trains all EPOCHS, keeps best-val ckpt
 #   W_NETDEM=2         up-weight congestion (the headline target)   (default 1)
 #   OUT=runs/<name>    output dir                                   (default runs/<encoder>)
 #
@@ -53,5 +54,5 @@ export FOLD="${FOLD:-${SLURM_ARRAY_TASK_ID:-all}}"
 # NOTE: this is False on the LOGIN node (no GPU there) — that's expected, not an error.
 python -c "import torch; assert torch.cuda.is_available(), 'CUDA NOT VISIBLE — reinstall torch with --index-url https://download.pytorch.org/whl/cu128'; print('GPU:', torch.cuda.get_device_name(0))"
 
-echo "encoder=${ENCODER:-dehnn} fold=${FOLD} epochs=${EPOCHS:-200} patience=${PATIENCE:-25} lr=${LR:-1e-3}"
+echo "encoder=${ENCODER:-dehnn} fold=${FOLD} epochs=${EPOCHS:-200} patience=${PATIENCE:-0} lr=${LR:-1e-3}"
 python src/train_fplace.py
