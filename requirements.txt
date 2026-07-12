@@ -1,0 +1,18 @@
+# PlaceDreamer — Python dependencies
+# Pure-Python / data / CPU deps — safe to pip install directly (pinned to what we developed on).
+numpy==2.0.2
+scipy==1.13.1
+pandas==2.3.3
+pyarrow==21.0.0
+networkx==3.2.1
+scikit-learn==1.6.1
+pymetis==2023.1.1        # METIS graph partitioning (virtual-node hierarchy)
+gdown==5.2.2             # scriptable Google-Drive download (dataset V1)
+
+# --- ML: install to MATCH the HPC's CUDA, do NOT blindly pip on a GPU node ---
+# torch: pick the build for the cluster's CUDA, e.g.
+#   pip install torch==2.8.0 --index-url https://download.pytorch.org/whl/cu121
+# torch_geometric (+ optional torch-scatter/torch-sparse wheels for that torch+CUDA):
+#   pip install torch_geometric
+torch==2.8.0
+torch_geometric        # not yet installed locally; needed for the DE-HNN encoder

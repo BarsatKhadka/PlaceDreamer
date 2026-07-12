@@ -9,3 +9,6 @@ picorv32/runs/
 *.log
 paperCodes/
 datasets/
+cache/
+venv/
+*.tar.gz

@@ -114,6 +114,25 @@ unoccupied in the literature; it's also the right lever against the ceiling, see
   the **gap between HPWL and routed WL**. Harder/noisier (cross-design ceiling ~0.37).
 - These two = **DE-HNN's proven targets** → evidence-backed, not invented. Aggregate HPWL is
   derivable (sum). Timing paths + power are computed downstream from these + netlist/library.
+- **Buffer count (added cells)** → *both* a target (emergent area/power — buffers cost both) *and*
+  the **composition bridge** (see below). f_place predicts placement + **resize-buffer count**;
+  f_cts predicts **clock-buffer count**. Labels from `area_metrics.buffer_area` / buffer-cell
+  counts, stage-resolved (fillers excluded — die-determined). Learnable: buffers ∝ clock fanout +
+  timing tightness (driven by the `clock_period` knob).
+
+**The buffer / stage-mismatch problem, and the fix (the composition seam, §5c):** the netlist
+*grows* across stages — resize adds ~timing buffers, CTS adds ~clock buffers, each *splitting*
+nets (e.g. aes_core 11,683 nets @ floorplan → 12,403 @ route). So **per-net predictions from an
+early stage don't align with a later stage** — feeding f_place's per-net vector into f_route is a
+mess. Fix:
+1. **Anchor the whole imagined pipeline on ONE netlist** (floorplan, pre-buffer). Both f_place and
+   f_route operate on it → no mid-pipeline net mismatch. Buffering happens in reality (labels
+   include it) but is *predicted/absorbed*, not passed as per-net structure.
+2. **Compose via buffer-robust state**: aggregate HPWL + per-cell congestion field + **predicted
+   buffer count** — NOT the exact per-net vector. Per-net HPWL stays an f_place *auxiliary/diagnostic*
+   head (for its own accuracy + inspectability), not fed forward net-by-net.
+3. **Predicting buffer count makes buffering explicit** → f_route conditions on it instead of
+   blindly absorbing it → explains variance otherwise dumped into the noise floor.
 
 **The ceiling (design around it, don't fight it):** netlist-only prediction is fundamentally
 limited — cross-design congestion tops out ~0.37 Pearson for *all* models (DE-HNN), and
@@ -262,3 +281,10 @@ few real OpenROAD runs as possible. Structure follows MBPO (read first-hand).
 - **f_route = shared light encoder + metric-matched heads** (WL/power = sum-pool; WNS = STA-style levelized MP; DRC = coarse risk/grounded) — survey: position-free works for WL/WNS, not DRC.
 - **DRC: defer / coarse risk, handle by grounding** — needs positions we don't have AND is ~0 in our current data.
 - **Agent = amortized PPO policy** (train once over designs against the world model → zero-shot knob-picking, invoke real runs only on chosen configs). Build after the world model is validated (MBPO).
+
+## Build log
+- **Representation builder done** (`scripts/build_graph.py`) — turns an EDA-Schema flow into the
+  DE-HNN bipartite graph: GATE→cells, NET→nets, driver/sink edges contracted from pin-edge
+  direction (GATE→PIN→NET=driver, NET→PIN→GATE=sink); cell feats (14, from standard_cells+degree),
+  net feats (fanout+io), Laplacian PE (10). Validated: aes_core (17k cells, 0 unknown types),
+  jpeg (64k cells). ~8.6s/flow (gates-table scan) → cache for training. VNs (METIS) still TODO.
