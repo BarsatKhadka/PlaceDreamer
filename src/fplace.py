@@ -34,20 +34,71 @@ def meta():
     if _META is None: _META = pd.read_parquet(f"{ROOT}/cache/meta.parquet").set_index("flow_id")
     return _META
 
-def norm():
+# Targets, in the log space they're trained in. Standardized to ~N(0,1) so the five
+# heads are commensurate: raw log-means run 2.4 (net_hpwl) to 11.2 (tot_hpwl), which
+# would let tot_hpwl dominate the gradient purely because of its units.
+TARGETS = ("net_hpwl", "net_dem", "tot_hpwl", "buf_area", "buf_cnt")
+
+def set_norm(train_designs, force=False):
+    """Build feature + target normalization from TRAINING designs ONLY.
+
+    Two things this fixes vs. the old norm():
+      * old code used sorted(glob)[:40], which is 40 flows of ONE design (ac97_ctrl) —
+        every design got z-scored by one small design's statistics.
+      * stats computed over all designs leak test/OOD statistics into training.
+    Call this ONCE per fold, before any load_graph().
+    """
     global _NORM
-    if _NORM is not None: return _NORM
-    f = f"{ROOT}/cache/norm.npz"
-    if os.path.exists(f): _NORM = dict(np.load(f)); return _NORM
-    cx, nx, df = [], [], []
-    for p in sorted(glob.glob(f"{CACHE}/*.npz"))[:40]:
-        d = np.load(p, allow_pickle=True)
-        cx.append(np.nan_to_num(np.concatenate([d["cell_x"], d["pe_cell"]], 1)))
-        nx.append(d["net_x"]); df.append(d["df_vals"])
+    key = hash(tuple(sorted(train_designs))) & 0xffffffff
+    f = f"{ROOT}/cache/norm_{key:08x}.npz"
+    if not force and os.path.exists(f):
+        _NORM = dict(np.load(f)); return _NORM
+
+    cx, nx, df, ynh, ynd = [], [], [], [], []
+    for dsg in sorted(train_designs):                       # stratified: every train design
+        fl = sorted(glob.glob(f"{CACHE}/{dsg}-*.npz"))
+        for p in fl[:2]:                                    # graph feats barely move with knobs
+            d = np.load(p, allow_pickle=True)
+            cx.append(np.nan_to_num(np.concatenate([d["cell_x"], d["pe_cell"]], 1)))
+            nx.append(d["net_x"]); df.append(d["df_vals"])
+        for p in fl[::11][:10]:                             # per-net targets DO move with knobs
+            d = np.load(p, allow_pickle=True)
+            a = d["net_hpwl"];   ynh.append(np.log(a[np.isfinite(a) & (a > 0)]))
+            b = d["net_demand"]; ynd.append(np.log(b[np.isfinite(b) & (b > 0)]))
     cx, nx, df = np.concatenate(cx), np.concatenate(nx), np.stack(df)
     _NORM = dict(cx_m=cx.mean(0), cx_s=cx.std(0)+1e-6, nx_m=nx.mean(0), nx_s=nx.std(0)+1e-6,
                  df_m=df.mean(0), df_s=df.std(0)+1e-6)
-    np.savez(f, **_NORM); return _NORM
+
+    # global targets: read straight off meta (free), train designs only
+    m = meta(); tr = m.index.str.replace(r"-\d+$", "", regex=True).isin(set(train_designs))
+    mt = m[tr]
+    gl = dict(tot_hpwl=np.log(np.maximum(mt.total_hpwl.values, 1e-6)),
+              buf_area=np.log(np.maximum(mt.buffer_area.values, 0) + 1.0),
+              buf_cnt =np.log(np.maximum(mt.buffer_count.values, 0) + 1.0))
+    ynh, ynd = np.concatenate(ynh), np.concatenate(ynd)
+    ys = dict(net_hpwl=ynh, net_dem=ynd, **gl)
+    for k in TARGETS:
+        v = ys[k]; v = v[np.isfinite(v)]
+        _NORM[f"y_{k}_m"] = np.float32(v.mean())
+        _NORM[f"y_{k}_s"] = np.float32(v.std() + 1e-6)
+    np.savez(f, **_NORM)
+    print(f"[norm] built from {len(train_designs)} TRAIN designs → {os.path.basename(f)}")
+    for k in TARGETS:
+        print(f"       {k:9} log-mean {float(_NORM[f'y_{k}_m']):7.3f}  std {float(_NORM[f'y_{k}_s']):6.3f}")
+    return _NORM
+
+def norm():
+    if _NORM is None:
+        raise RuntimeError("call set_norm(train_designs) before load_graph() — "
+                           "normalization must come from TRAIN designs only (no leakage).")
+    return _NORM
+
+def denorm(k, v):
+    """standardized log-space -> log-space (for reporting in real units)."""
+    n = norm(); return v * float(n[f"y_{k}_s"]) + float(n[f"y_{k}_m"])
+
+def _z(k, v):
+    n = norm(); return (v - float(n[f"y_{k}_m"])) / float(n[f"y_{k}_s"])
 
 def load_graph(flow_id, device="cpu"):
     d = np.load(f"{CACHE}/{flow_id}.npz", allow_pickle=True)
@@ -70,13 +121,15 @@ def load_graph(flow_id, device="cpu"):
         ntn=torch.cat([ed, es], 1),                                    # cell→net [cell; net]
         ntn_type=torch.cat([torch.ones(ed.size(1)), torch.zeros(es.size(1))]),
         ntc=torch.cat([ed.flip(0), es.flip(0)], 1),                    # net→cell [net; cell]
-        y_net_hpwl=torch.log(t(d["net_hpwl"]).clamp(min=1e-6)),
+        # all targets: log space, then STANDARDIZED with train-fold stats -> ~N(0,1).
+        # (raw log-means span 2.4..11.2; unstandardized, tot_hpwl swamps the gradient.)
+        y_net_hpwl=_z("net_hpwl", torch.log(t(d["net_hpwl"]).clamp(min=1e-6))),
         m_net_hpwl=t(np.isfinite(d["net_hpwl"]) & (d["net_hpwl"] > 0), torch.bool),
-        y_net_dem =torch.log(t(d["net_demand"]).clamp(min=1e-6)),
+        y_net_dem =_z("net_dem",  torch.log(t(d["net_demand"]).clamp(min=1e-6))),
         m_net_dem =t(np.isfinite(d["net_demand"]) & (d["net_demand"] > 0), torch.bool),
-        y_tot_hpwl=t(np.log(max(m.total_hpwl, 1e-6))),
-        y_buf_area=t(np.log(max(m.buffer_area, 0) + 1.0)),
-        y_buf_cnt =t(np.log(max(bufcnt, 0) + 1.0) if np.isfinite(bufcnt) else 0.0),
+        y_tot_hpwl=_z("tot_hpwl", t(np.log(max(m.total_hpwl, 1e-6)))),
+        y_buf_area=_z("buf_area", t(np.log(max(m.buffer_area, 0) + 1.0))),
+        y_buf_cnt =_z("buf_cnt",  t(np.log(max(bufcnt, 0) + 1.0))) if np.isfinite(bufcnt) else t(0.0),
         has_bufcnt=bool(np.isfinite(bufcnt)),
     )
     return {k: (v.to(device) if torch.is_tensor(v) else v) for k, v in g.items()}
@@ -195,12 +248,23 @@ class FPlace(nn.Module):
         return dict(net_hpwl=self.h_net_hpwl(hn), net_dem=self.h_net_dem(hn),
                     tot_hpwl=self.h_tot(hg), buf_area=self.h_buf_area(hg), buf_cnt=self.h_buf_cnt(hg))
 
-def gnll(pred, y, mask=None):
-    mu, lv = pred[..., 0], pred[..., 1].clamp(-8, 8)
+def gnll(pred, y, mask=None, nll=True):
+    """Gaussian NLL on standardized targets.
+
+    nll=False -> plain MSE on the mean (the variance head is ignored).
+    WHY: with NLL from step 0 the model shrinks logvar to cut the loss on points it
+    already fits (train loss goes NEGATIVE), then any miss on val is divided by
+    exp(logvar) and explodes. Seen here: train -0.13 / val 27.6 at epoch 1.
+    So we warm up the mean with MSE, then switch NLL on once mu is sane.
+    Clamp is (-5,5): targets are unit-scale now, so logvar has no business outside that.
+    """
+    mu, lv = pred[..., 0], pred[..., 1].clamp(-5, 5)
     if mask is not None:
         if mask.sum() == 0: return torch.zeros((), device=mu.device)
         mu, lv, y = mu[mask], lv[mask], y[mask]
-    return 0.5 * (lv + (y - mu).pow(2) / lv.exp()).mean()
+    se = (y - mu).pow(2)
+    if not nll: return 0.5 * se.mean()
+    return 0.5 * (lv + se / lv.exp()).mean()
 
 def loss_fn(out, g):
     L = (gnll(out["net_hpwl"], g["y_net_hpwl"], g["m_net_hpwl"])

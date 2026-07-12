@@ -23,7 +23,7 @@ import os, sys, glob, json, time, random
 import numpy as np, pandas as pd, torch
 from scipy.stats import pearsonr
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from fplace import FPlace, load_graph, loss_fn, gnll, meta, CACHE
+from fplace import FPlace, load_graph, loss_fn, gnll, meta, CACHE, set_norm, denorm
 
 E = os.environ.get
 DEV     = "cuda" if torch.cuda.is_available() else "cpu"
@@ -32,6 +32,7 @@ EPOCHS  = int(E("EPOCHS", 200)); LR = float(E("LR", 1e-3))
 DIM     = int(E("DIM", 64));    LAYERS = int(E("LAYERS", 4))
 ACCUM   = int(E("ACCUM", 8));   SEED = int(E("SEED", 0))
 PATIENCE = int(E("PATIENCE", 0))    # 0 = no early stopping, train all EPOCHS (set >0 to enable)
+WARMUP   = int(E("WARMUP", 20))     # epochs of MSE-on-mean before the variance head turns on
 OUT     = E("OUT", f"runs/{ENCODER}")
 W = dict(net_hpwl=float(E("W_NETHPWL",1)), net_dem=float(E("W_NETDEM",1)),
          tot_hpwl=float(E("W_TOT",1)), buf_area=float(E("W_BUFA",1)), buf_cnt=float(E("W_BUFC",1)))
@@ -65,12 +66,12 @@ def flows_of(designs):
     idx = meta().index
     return [f for f in idx if f.rsplit("-", 1)[0] in set(designs)]
 
-def wloss(out, g):
-    L = (W["net_hpwl"] * gnll(out["net_hpwl"], g["y_net_hpwl"], g["m_net_hpwl"])
-       + W["net_dem"]  * gnll(out["net_dem"],  g["y_net_dem"],  g["m_net_dem"])
-       + W["tot_hpwl"] * gnll(out["tot_hpwl"], g["y_tot_hpwl"])
-       + W["buf_area"] * gnll(out["buf_area"], g["y_buf_area"]))
-    if g["has_bufcnt"]: L = L + W["buf_cnt"] * gnll(out["buf_cnt"], g["y_buf_cnt"])
+def wloss(out, g, nll=True):
+    L = (W["net_hpwl"] * gnll(out["net_hpwl"], g["y_net_hpwl"], g["m_net_hpwl"], nll)
+       + W["net_dem"]  * gnll(out["net_dem"],  g["y_net_dem"],  g["m_net_dem"],  nll)
+       + W["tot_hpwl"] * gnll(out["tot_hpwl"], g["y_tot_hpwl"], None, nll)
+       + W["buf_area"] * gnll(out["buf_area"], g["y_buf_area"], None, nll))
+    if g["has_bufcnt"]: L = L + W["buf_cnt"] * gnll(out["buf_cnt"], g["y_buf_cnt"], None, nll)
     return L
 
 @torch.no_grad()
@@ -96,8 +97,10 @@ def evaluate(model, flows):
         ok = np.isfinite(p) & np.isfinite(t)
         p, t = p[ok], t[ok]
         if len(t) < 3 or t.std() < 1e-9: continue
-        r2 = 1 - ((t-p)**2).sum()/((t-t.mean())**2).sum()
-        rel = float(np.median(np.abs(np.expm1(p-t))))
+        r2 = 1 - ((t-p)**2).sum()/((t-t.mean())**2).sum()   # affine-invariant: same in std or log space
+        # p,t are STANDARDIZED log. un-standardize the residual to get a real relative error.
+        lp, lt = denorm(k, p), denorm(k, t)
+        rel = float(np.median(np.abs(np.expm1(lp - lt))))
         res[k] = dict(r2=float(r2), rel_err=rel, n=int(len(t)))
     # within-design r on the GLOBAL targets (knob-effect signal, size held constant)
     for k in ("tot_hpwl","buf_area","buf_cnt"):
@@ -115,6 +118,9 @@ def run_fold(fi, test_designs, all_designs):
     print(f"\n=== fold {fi}: test on {len(test_designs)} designs {test_designs}", flush=True)
     print(f"    train {len(tr)} flows / {len(train_d)} designs | val {len(val)} | test {len(te)}", flush=True)
 
+    # normalization from TRAIN designs only — no test/OOD statistics ever touch the model
+    set_norm(train_d)
+
     model = FPlace(d=DIM, K=LAYERS, encoder=ENCODER).to(DEV)
     opt = torch.optim.Adam(model.parameters(), lr=LR)
     # long runs plateau; halve the LR when val stalls, floor at 1e-5.
@@ -122,26 +128,30 @@ def run_fold(fi, test_designs, all_designs):
         opt, mode="min", factor=0.5, patience=10, min_lr=1e-5)
     best, best_state, patience = 1e9, None, 0   # we always KEEP the best-val checkpoint
     for ep in range(EPOCHS):
+        nll = ep >= WARMUP          # MSE on the mean first; variance head only once mu is sane
+        if ep == WARMUP:
+            print(f"  --- epoch {ep}: NLL on (variance head active) ---", flush=True)
+            best, patience = 1e9, 0  # loss changes meaning here; restart best-tracking
         model.train(); rng.shuffle(tr); t0=time.time(); tot=0.0
         opt.zero_grad()
         for i, f in enumerate(tr):
             g = load_graph(f, DEV)
-            l = wloss(model(g), g) / ACCUM
+            l = wloss(model(g), g, nll) / ACCUM
             l.backward(); tot += l.item()*ACCUM
             if (i+1) % ACCUM == 0:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                 opt.step(); opt.zero_grad()
         opt.step(); opt.zero_grad()
-        # val
+        # val — scored the same way the epoch was trained
         model.eval(); vl=0.0
         with torch.no_grad():
             for f in val:
-                g = load_graph(f, DEV); vl += wloss(model(g), g).item()
+                g = load_graph(f, DEV); vl += wloss(model(g), g, nll).item()
         vl /= max(1,len(val))
         sched.step(vl)
         lr_now = opt.param_groups[0]["lr"]
-        print(f"  ep {ep:3d}  train {tot/len(tr):.4f}  val {vl:.4f}  lr {lr_now:.2e}  "
-              f"({time.time()-t0:.0f}s)", flush=True)
+        print(f"  ep {ep:3d}  [{'nll' if nll else 'mse'}]  train {tot/len(tr):8.4f}  "
+              f"val {vl:8.4f}  lr {lr_now:.2e}  ({time.time()-t0:.0f}s)", flush=True)
         if vl < best - 1e-4:
             best, best_state, patience = vl, {k:v.detach().cpu().clone() for k,v in model.state_dict().items()}, 0
         else:
@@ -160,12 +170,17 @@ def run_fold(fi, test_designs, all_designs):
 def eval_ood():
     """FINAL test — run ONCE, at the very end, on the locked OOD designs.
     Loads the fold checkpoints (trained only on dev) and evaluates on designs never seen."""
+    dev, folds = make_folds()
     te = flows_of(OOD_DESIGNS)
     print(f"\n########## LOCKED OOD EVALUATION ##########")
     print(f"OOD designs (never trained/tuned on): {OOD_DESIGNS}")
     print(f"{len(te)} test flows\n")
     allres = []
     for ck in sorted(glob.glob(f"{OUT}/fold*.pt")):
+        fi = int(os.path.basename(ck)[4:-3])                 # fold<N>.pt
+        # each checkpoint was trained with ITS fold's normalization — restore exactly that,
+        # or the predictions come back on the wrong scale.
+        set_norm([d for d in dev if d not in folds[fi]])
         model = FPlace(d=DIM, K=LAYERS, encoder=ENCODER).to(DEV)
         model.load_state_dict(torch.load(ck, map_location=DEV)); model.eval()
         r = evaluate(model, te); allres.append(r)
