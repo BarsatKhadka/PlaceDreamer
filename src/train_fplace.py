@@ -111,7 +111,14 @@ def evaluate(model, flows):
             rel = float(np.median(np.abs(np.expm1(denorm(k, p) - denorm(k, t)))))
         else:           # wns/tns: report median abs error in standardized units
             rel = float(np.median(np.abs(p - t)))
-        res[k] = dict(r2=float(r2), rel_err=rel, n=int(len(t)))
+        # calibration: mean predicted sigma / actual RMSE. ~1.0 = trustworthy uncertainty,
+        # <1 overconfident, >1 underconfident. This is what the grounding loop keys on.
+        s = np.concatenate(sig[k])[ok]
+        pred_sigma = float(np.mean(np.exp(0.5 * np.clip(s, -5, 5))))
+        rmse = float(np.sqrt(np.mean((t - p) ** 2)))
+        calib = pred_sigma / rmse if rmse > 1e-9 else float("nan")
+        res[k] = dict(r2=float(r2), rel_err=rel, n=int(len(t)),
+                      pred_sigma=pred_sigma, rmse=rmse, calib=calib)
     # within-design r on the GLOBAL targets (knob-effect signal, size held constant)
     for k in GLOB:
         p, t, dd = np.concatenate(P[k]), np.concatenate(T[k]), np.array(dz)
@@ -193,9 +200,11 @@ def run_fold(fi, test_designs, all_designs):
     if best_state: model.load_state_dict(best_state)
     torch.save(model.state_dict(), f"{OUT}/fold{fi}.pt")
     res = evaluate(model, te)
-    print(f"  TEST (unseen designs): " + " | ".join(
-        f"{k}: R²={v['r2']:.3f} rel={v['rel_err']*100:.1f}%" + (f" wr={v['within_r']:.2f}" if 'within_r' in v else "")
-        for k,v in res.items()), flush=True)
+    print(f"  TEST (unseen designs):", flush=True)
+    for k, v in res.items():
+        wr = f" within-r={v['within_r']:+.2f}" if 'within_r' in v else ""
+        print(f"      {k:9} R²={v['r2']:+.3f}  rel={v['rel_err']*100:5.1f}%  "
+              f"calib(σ/rmse)={v['calib']:.2f}{wr}", flush=True)
     return dict(fold=fi, test_designs=test_designs, n_train=len(tr), n_test=len(te), metrics=res)
 
 def eval_ood():
