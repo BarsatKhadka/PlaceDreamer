@@ -33,6 +33,8 @@ DIM     = int(E("DIM", 64));    LAYERS = int(E("LAYERS", 4))
 ACCUM   = int(E("ACCUM", 8));   SEED = int(E("SEED", 0))
 PATIENCE = int(E("PATIENCE", 0))    # 0 = no early stopping, train all EPOCHS (set >0 to enable)
 WARMUP   = int(E("WARMUP", 20))     # epochs of MSE-on-mean before the variance head turns on
+BETA     = float(E("BETA", 0.5))    # beta-NLL exponent (Seitzer 2022); 0=plain NLL, 1=MSE grads
+NLL_LR_MULT = float(E("NLL_LR_MULT", 0.2))   # LR drop when the objective switches to NLL
 OUT     = E("OUT", f"runs/{ENCODER}")
 W = dict(net_hpwl=float(E("W_NETHPWL",1)), net_dem=float(E("W_NETDEM",1)),
          tot_hpwl=float(E("W_TOT",1)), buf_area=float(E("W_BUFA",1)), buf_cnt=float(E("W_BUFC",1)))
@@ -130,8 +132,13 @@ def run_fold(fi, test_designs, all_designs):
     for ep in range(EPOCHS):
         nll = ep >= WARMUP          # MSE on the mean first; variance head only once mu is sane
         if ep == WARMUP:
-            print(f"  --- epoch {ep}: NLL on (variance head active) ---", flush=True)
-            best, patience = 1e9, 0  # loss changes meaning here; restart best-tracking
+            # the objective changes here, so the loss VALUE is not comparable across this
+            # boundary: restart best-tracking, and drop the LR (a 1e-3 step that was fine
+            # for MSE destabilizes beta-NLL, which has the extra logvar term to fit).
+            for pg in opt.param_groups: pg["lr"] = LR * NLL_LR_MULT
+            sched._reset() if hasattr(sched, "_reset") else None
+            best, patience = 1e9, 0
+            print(f"  --- epoch {ep}: beta-NLL on (beta={BETA}), lr -> {LR*NLL_LR_MULT:.1e} ---", flush=True)
         model.train(); rng.shuffle(tr); t0=time.time(); tot=0.0
         opt.zero_grad()
         for i, f in enumerate(tr):

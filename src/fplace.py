@@ -324,23 +324,36 @@ class FPlace(nn.Module):
         return dict(net_hpwl=self.h_net_hpwl(hn), net_dem=self.h_net_dem(hn),
                     tot_hpwl=self.h_tot(hg), buf_area=self.h_buf_area(hg), buf_cnt=self.h_buf_cnt(hg))
 
-def gnll(pred, y, mask=None, nll=True):
-    """Gaussian NLL on standardized targets.
+BETA = float(os.environ.get("BETA", 0.5))   # beta-NLL exponent; 0 = plain NLL, 1 = MSE gradients
 
-    nll=False -> plain MSE on the mean (the variance head is ignored).
-    WHY: with NLL from step 0 the model shrinks logvar to cut the loss on points it
-    already fits (train loss goes NEGATIVE), then any miss on val is divided by
-    exp(logvar) and explodes. Seen here: train -0.13 / val 27.6 at epoch 1.
-    So we warm up the mean with MSE, then switch NLL on once mu is sane.
-    Clamp is (-5,5): targets are unit-scale now, so logvar has no business outside that.
+def gnll(pred, y, mask=None, nll=True, beta=None):
+    """beta-NLL (Seitzer et al. 2022, "On the Pitfalls of Heteroscedastic Uncertainty
+    Estimation") on standardized targets.
+
+    nll=False -> plain MSE on the mean (warm-up; variance head ignored).
+
+    WHY beta-NLL and not plain Gaussian NLL:
+      d(NLL)/d(mu) is scaled by 1/sigma^2. So the model shrinks sigma on points it already
+      fits, which AMPLIFIES their gradient, which shrinks sigma further — a runaway loop.
+      It bottoms out at the logvar clamp and every miss is then divided by exp(-5), so the
+      loss detonates. We watched exactly this twice:
+        no warm-up:   ep1  train -0.13  val 27.6
+        MSE warm-up:  ep20 train -5.98  val 62.4   (mean was FINE at mse 0.24 — not the cause)
+      beta-NLL multiplies each point's loss by a DETACHED sigma^(2*beta), cancelling that
+      1/sigma^2 amplification. beta=0.5 is the paper's recommendation: keeps calibrated
+      uncertainty, but the mean trains with near-MSE-stable gradients.
     """
+    beta = BETA if beta is None else beta
     mu, lv = pred[..., 0], pred[..., 1].clamp(-5, 5)
     if mask is not None:
         if mask.sum() == 0: return torch.zeros((), device=mu.device)
         mu, lv, y = mu[mask], lv[mask], y[mask]
     se = (y - mu).pow(2)
     if not nll: return 0.5 * se.mean()
-    return 0.5 * (lv + se / lv.exp()).mean()
+    l = 0.5 * (lv + se / lv.exp())
+    if beta > 0:
+        l = l * lv.mul(beta).exp().detach()      # stopgrad(sigma^(2*beta))
+    return l.mean()
 
 def loss_fn(out, g):
     L = (gnll(out["net_hpwl"], g["y_net_hpwl"], g["m_net_hpwl"])
