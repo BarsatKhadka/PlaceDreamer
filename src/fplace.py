@@ -34,10 +34,22 @@ def meta():
     if _META is None: _META = pd.read_parquet(f"{ROOT}/cache/meta.parquet").set_index("flow_id")
     return _META
 
-# Targets, in the log space they're trained in. Standardized to ~N(0,1) so the five
-# heads are commensurate: raw log-means run 2.4 (net_hpwl) to 11.2 (tot_hpwl), which
-# would let tot_hpwl dominate the gradient purely because of its units.
-TARGETS = ("net_hpwl", "net_dem", "tot_hpwl", "buf_area", "buf_cnt")
+# f_place placement-state targets. All standardized to ~N(0,1) before training so the
+# heads are commensurate (raw scales span log-means 2.4..11.2 and slacks 0.7..-35446).
+#   LOG targets:    strictly positive magnitudes -> log() then z-score.
+#   SIGNED targets: slack is <=0 and heavy-tailed -> signed-log compress, then z-score.
+LOG_TARGETS    = ("net_hpwl", "net_dem", "tot_hpwl", "buf_area", "buf_cnt")
+SIGNED_TARGETS = ("wns", "tns")                 # placement timing @ place_resized
+TARGETS        = LOG_TARGETS + SIGNED_TARGETS
+
+def _tf(k, x):
+    """raw target -> base transform (BEFORE standardization). np or torch."""
+    if k == "wns": return x                                    # slack ~[-6, 0.7]: use raw
+    if k == "tns":                                             # <=0, tail to -35446: signed-log
+        neg = (-x).clamp(min=0) if hasattr(x, "clamp") else np.maximum(-x, 0)
+        return -(neg.log1p() if hasattr(neg, "log1p") else np.log1p(neg))
+    # LOG targets handled at their call sites (they already log before _z)
+    return x
 
 # ---------- feature pre-transform (BEFORE z-scoring) ----------
 # Unbounded non-negative magnitudes get log1p first: they have brutal right tails
@@ -149,7 +161,9 @@ def set_norm(train_designs, force=False):
     mt = m[tr]
     gl = dict(tot_hpwl=np.log(np.maximum(mt.total_hpwl.values, 1e-6)),
               buf_area=np.log(np.maximum(mt.buffer_area.values, 0) + 1.0),
-              buf_cnt =np.log(np.maximum(mt.buffer_count.values, 0) + 1.0))
+              buf_cnt =np.log(np.maximum(mt.buffer_count.values, 0) + 1.0),
+              wns=_tf("wns", mt.wns.values.astype(np.float32)),
+              tns=_tf("tns", mt.tns.values.astype(np.float32)))
     ynh, ynd = np.concatenate(ynh), np.concatenate(ynd)
     ys = dict(net_hpwl=ynh, net_dem=ynd, **gl)
     for k in TARGETS:
@@ -207,6 +221,9 @@ def load_graph(flow_id, device="cpu"):
         y_buf_area=_z("buf_area", t(np.log(max(m.buffer_area, 0) + 1.0))),
         y_buf_cnt =_z("buf_cnt",  t(np.log(max(bufcnt, 0) + 1.0))) if np.isfinite(bufcnt) else t(0.0),
         has_bufcnt=bool(np.isfinite(bufcnt)),
+        # placement timing @ place_resized (signed -> _tf, then standardized)
+        y_wns=_z("wns", _tf("wns", t(float(m.wns)))),
+        y_tns=_z("tns", _tf("tns", t(float(m.tns)))),
     )
     return {k: (v.to(device) if torch.is_tensor(v) else v) for k, v in g.items()}
 
@@ -292,6 +309,7 @@ class FPlace(nn.Module):
         self.fc1_net, self.fc1_glob = Linear(d, 256), Linear(2*d, 256)
         self.h_net_hpwl, self.h_net_dem = Linear(256, 2), Linear(256, 2)
         self.h_tot, self.h_buf_area, self.h_buf_cnt = Linear(256, 2), Linear(256, 2), Linear(256, 2)
+        self.h_wns, self.h_tns = Linear(256, 2), Linear(256, 2)     # placement timing (global)
 
     def forward(self, g):
         h     = self.node_encoder(g["cell_x"]) + self.type_emb(g["cell_type"])
@@ -322,7 +340,8 @@ class FPlace(nn.Module):
         hn = F.leaky_relu(self.fc1_net(h_net))
         hg = F.leaky_relu(self.fc1_glob(torch.cat([h.mean(0), h_net.mean(0)])))
         return dict(net_hpwl=self.h_net_hpwl(hn), net_dem=self.h_net_dem(hn),
-                    tot_hpwl=self.h_tot(hg), buf_area=self.h_buf_area(hg), buf_cnt=self.h_buf_cnt(hg))
+                    tot_hpwl=self.h_tot(hg), buf_area=self.h_buf_area(hg), buf_cnt=self.h_buf_cnt(hg),
+                    wns=self.h_wns(hg), tns=self.h_tns(hg))
 
 LOSS   = os.environ.get("LOSS", "decoupled")     # decoupled | beta | nll | mse
 BETA   = float(os.environ.get("BETA", 0.5))      # for LOSS=beta

@@ -40,7 +40,8 @@ WARMUP   = int(E("WARMUP", 0))      # 0 = off. Only meaningful for LOSS=beta/nll
 NLL_LR_MULT = float(E("NLL_LR_MULT", 1.0))
 OUT     = E("OUT", f"runs/{ENCODER}")
 W = dict(net_hpwl=float(E("W_NETHPWL",1)), net_dem=float(E("W_NETDEM",1)),
-         tot_hpwl=float(E("W_TOT",1)), buf_area=float(E("W_BUFA",1)), buf_cnt=float(E("W_BUFC",1)))
+         tot_hpwl=float(E("W_TOT",1)), buf_area=float(E("W_BUFA",1)), buf_cnt=float(E("W_BUFC",1)),
+         wns=float(E("W_WNS",1)), tns=float(E("W_TNS",1)))
 torch.manual_seed(SEED); random.seed(SEED); np.random.seed(SEED)
 os.makedirs(OUT, exist_ok=True)
 
@@ -75,7 +76,9 @@ def wloss(out, g, nll=True):
     L = (W["net_hpwl"] * gnll(out["net_hpwl"], g["y_net_hpwl"], g["m_net_hpwl"], nll)
        + W["net_dem"]  * gnll(out["net_dem"],  g["y_net_dem"],  g["m_net_dem"],  nll)
        + W["tot_hpwl"] * gnll(out["tot_hpwl"], g["y_tot_hpwl"], None, nll)
-       + W["buf_area"] * gnll(out["buf_area"], g["y_buf_area"], None, nll))
+       + W["buf_area"] * gnll(out["buf_area"], g["y_buf_area"], None, nll)
+       + W["wns"]      * gnll(out["wns"],      g["y_wns"],      None, nll)
+       + W["tns"]      * gnll(out["tns"],      g["y_tns"],      None, nll))
     if g["has_bufcnt"]: L = L + W["buf_cnt"] * gnll(out["buf_cnt"], g["y_buf_cnt"], None, nll)
     return L
 
@@ -83,17 +86,19 @@ def wloss(out, g, nll=True):
 def evaluate(model, flows):
     """collect predictions vs truth for every target."""
     model.eval()
-    P = {k: [] for k in ("net_hpwl","net_dem","tot_hpwl","buf_area","buf_cnt")}
+    NET = ("net_hpwl","net_dem")                                    # per-net (masked) heads
+    GLOB = ("tot_hpwl","buf_area","buf_cnt","wns","tns")            # per-flow scalar heads
+    LOGK = ("net_hpwl","net_dem","tot_hpwl","buf_area","buf_cnt")   # log targets -> rel-err via expm1
+    P = {k: [] for k in NET+GLOB}
     T = {k: [] for k in P}; sig = {k: [] for k in P}; dz = []
     for f in flows:
         g = load_graph(f, DEV); o = model(g)
-        for k in ("net_hpwl","net_dem"):
-            m = g["m_net_hpwl"] if k=="net_hpwl" else g["m_net_dem"]
-            y = g["y_net_hpwl"] if k=="net_hpwl" else g["y_net_dem"]
+        for k in NET:
+            m = g[f"m_{k}"]; y = g[f"y_{k}"]
             P[k].append(o[k][m,0].cpu().numpy()); T[k].append(y[m].cpu().numpy())
             sig[k].append(o[k][m,1].cpu().numpy())
-        for k, y in (("tot_hpwl",g["y_tot_hpwl"]),("buf_area",g["y_buf_area"]),("buf_cnt",g["y_buf_cnt"])):
-            P[k].append(np.array([o[k][0].item()])); T[k].append(np.array([y.item()]))
+        for k in GLOB:
+            P[k].append(np.array([o[k][0].item()])); T[k].append(np.array([g[f"y_{k}"].item()]))
             sig[k].append(np.array([o[k][1].item()]))
         dz.append(f.rsplit("-",1)[0])
     res = {}
@@ -103,12 +108,13 @@ def evaluate(model, flows):
         p, t = p[ok], t[ok]
         if len(t) < 3 or t.std() < 1e-9: continue
         r2 = 1 - ((t-p)**2).sum()/((t-t.mean())**2).sum()   # affine-invariant: same in std or log space
-        # p,t are STANDARDIZED log. un-standardize the residual to get a real relative error.
-        lp, lt = denorm(k, p), denorm(k, t)
-        rel = float(np.median(np.abs(np.expm1(lp - lt))))
+        if k in LOGK:   # standardized log -> un-standardize, relative error via expm1
+            rel = float(np.median(np.abs(np.expm1(denorm(k, p) - denorm(k, t)))))
+        else:           # wns/tns: report median abs error in standardized units
+            rel = float(np.median(np.abs(p - t)))
         res[k] = dict(r2=float(r2), rel_err=rel, n=int(len(t)))
     # within-design r on the GLOBAL targets (knob-effect signal, size held constant)
-    for k in ("tot_hpwl","buf_area","buf_cnt"):
+    for k in GLOB:
         p, t, dd = np.concatenate(P[k]), np.concatenate(T[k]), np.array(dz)
         rs = [pearsonr(p[dd==d], t[dd==d])[0] for d in np.unique(dd)
               if (dd==d).sum() > 2 and t[dd==d].std() > 1e-9 and p[dd==d].std() > 1e-9]
@@ -148,27 +154,36 @@ def run_fold(fi, test_designs, all_designs):
                 torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                 opt.step(); opt.zero_grad()
         opt.step(); opt.zero_grad()
-        # val — scored the same way the epoch was trained.
-        # ALSO track val R² on the two heads we actually care about: the scalar loss can
-        # sit flat while mu keeps improving (or rot) and you'd never see it.
-        model.eval(); vl=0.0; sse={"net_dem":0.,"net_hpwl":0.}; sst={"net_dem":0.,"net_hpwl":0.}
+        # val — scored the same way the epoch was trained, PLUS per-target R² so we can
+        # watch every placement metric (not just the scalar loss) improve in real time.
+        NETK  = ("net_hpwl","net_dem")
+        GLOBK = ("tot_hpwl","buf_area","buf_cnt","wns","tns")
+        model.eval(); vl=0.0
+        sse={k:0. for k in NETK}; sst={k:0. for k in NETK}
+        gp={k:[] for k in GLOBK}; gt={k:[] for k in GLOBK}
         with torch.no_grad():
             for f in val:
                 g = load_graph(f, DEV); o = model(g)
                 vl += wloss(o, g, nll).item()
-                for k in ("net_dem","net_hpwl"):
-                    m_, y_ = g[f"m_{k}"], g[f"y_{k}"]
+                for k in NETK:
+                    m_ = g[f"m_{k}"]
                     if m_.sum() < 3: continue
-                    p_, t_ = o[k][m_,0], y_[m_]
-                    sse[k] += (t_-p_).pow(2).sum().item()
-                    sst[k] += (t_-t_.mean()).pow(2).sum().item()
+                    p_, t_ = o[k][m_,0], g[f"y_{k}"][m_]
+                    sse[k] += (t_-p_).pow(2).sum().item(); sst[k] += (t_-t_.mean()).pow(2).sum().item()
+                for k in GLOBK:
+                    gp[k].append(o[k][0].item()); gt[k].append(g[f"y_{k}"].item())
         vl /= max(1,len(val))
-        r2 = {k: (1 - sse[k]/sst[k]) if sst[k] > 0 else float("nan") for k in sse}
+        r2 = {k: (1 - sse[k]/sst[k]) if sst[k] > 0 else float("nan") for k in NETK}
+        for k in GLOBK:
+            p_, t_ = np.array(gp[k]), np.array(gt[k])
+            r2[k] = (1 - ((t_-p_)**2).sum()/((t_-t_.mean())**2).sum()) if t_.std() > 1e-9 else float("nan")
         sched.step(vl)
         lr_now = opt.param_groups[0]["lr"]
-        print(f"  ep {ep:3d}  [{'nll' if nll else 'mse'}]  train {tot/len(tr):8.4f}  "
-              f"val {vl:8.4f}  | val R²: dem {r2['net_dem']:+.3f}  hpwl {r2['net_hpwl']:+.3f}  "
-              f"| lr {lr_now:.2e}  ({time.time()-t0:.0f}s)", flush=True)
+        print(f"  ep {ep:3d} [{'nll' if nll else 'mse'}] tr {tot/len(tr):7.3f} vl {vl:7.3f} | "
+              f"R² hpwl {r2['net_hpwl']:+.3f} tot {r2['tot_hpwl']:+.3f} "
+              f"bufA {r2['buf_area']:+.3f} bufC {r2['buf_cnt']:+.3f} "
+              f"wns {r2['wns']:+.3f} tns {r2['tns']:+.3f} | lr {lr_now:.1e} ({time.time()-t0:.0f}s)",
+              flush=True)
         if vl < best - 1e-4:
             best, best_state, patience = vl, {k:v.detach().cpu().clone() for k,v in model.state_dict().items()}, 0
         else:
@@ -204,7 +219,7 @@ def eval_ood():
         print(f"  {os.path.basename(ck)}: " + " | ".join(
             f"{k}: R²={v['r2']:.3f} rel={v['rel_err']*100:.1f}%" for k, v in r.items()))
     print("\n=== OOD (ensemble across folds) ===")
-    for k in ("net_hpwl","net_dem","tot_hpwl","buf_area","buf_cnt"):
+    for k in ("net_hpwl","net_dem","tot_hpwl","buf_area","buf_cnt","wns","tns"):
         r2 = [r[k]["r2"] for r in allres if k in r]
         if r2: print(f"  {k:10} R² = {np.mean(r2):.3f} ± {np.std(r2):.3f}")
     json.dump(allres, open(f"{OUT}/ood_results.json","w"), indent=2)
@@ -218,7 +233,7 @@ def aggregate():
     if not out:
         print(f"no {OUT}/results_fold*.json yet — folds still running?"); return
     print(f"\n=== AGGREGATE across {len(out)} folds (unseen designs) — {OUT} ===")
-    for k in ("net_hpwl","net_dem","tot_hpwl","buf_area","buf_cnt"):
+    for k in ("net_hpwl","net_dem","tot_hpwl","buf_area","buf_cnt","wns","tns"):
         r2 = [f["metrics"][k]["r2"] for f in out if k in f["metrics"]]
         wr = [f["metrics"][k]["within_r"] for f in out
               if k in f["metrics"] and "within_r" in f["metrics"][k]]
