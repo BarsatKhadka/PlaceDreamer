@@ -38,7 +38,10 @@ def meta():
 # heads are commensurate (raw scales span log-means 2.4..11.2 and slacks 0.7..-35446).
 #   LOG targets:    strictly positive magnitudes -> log() then z-score.
 #   SIGNED targets: slack is <=0 and heavy-tailed -> signed-log compress, then z-score.
-LOG_TARGETS    = ("net_hpwl", "net_dem", "tot_hpwl", "buf_area", "buf_cnt")
+# net_dem (per-net RUDY-from-bbox) was DROPPED: it's -0.94 correlated with net_hpwl (same
+# bounding box, two views) — a circular target that proves nothing. Real congestion is a
+# per-TILE field / router quantity, not per-net, and lives on the data_gen path, not here.
+LOG_TARGETS    = ("net_hpwl", "tot_hpwl", "buf_area", "buf_cnt")
 SIGNED_TARGETS = ("wns", "tns")                 # placement timing @ place_resized
 TARGETS        = LOG_TARGETS + SIGNED_TARGETS
 
@@ -133,7 +136,7 @@ def set_norm(train_designs, force=False):
     if not force and os.path.exists(f):
         _NORM = dict(np.load(f)); return _NORM
 
-    cx, nx, df, ynh, ynd = [], [], [], [], []
+    cx, nx, df, ynh = [], [], [], []
     for dsg in sorted(train_designs):                       # stratified: every train design
         fl = sorted(glob.glob(f"{CACHE}/{dsg}-*.npz"))
         for p in fl[:2]:                                    # graph feats barely move with knobs
@@ -143,7 +146,6 @@ def set_norm(train_designs, force=False):
         for p in fl[::11][:10]:                             # per-net targets DO move with knobs
             d = np.load(p, allow_pickle=True)
             a = d["net_hpwl"];   ynh.append(np.log(a[np.isfinite(a) & (a > 0)]))
-            b = d["net_demand"]; ynd.append(np.log(b[np.isfinite(b) & (b > 0)]))
     cx, nx, df = np.concatenate(cx), np.concatenate(nx), np.stack(df)
     cx_m, cx_s, cx_d = _stats(cx, IDENT_CELL)
     nx_m, nx_s, nx_d = _stats(nx, IDENT_NET)
@@ -164,8 +166,7 @@ def set_norm(train_designs, force=False):
               buf_cnt =np.log(np.maximum(mt.buffer_count.values, 0) + 1.0),
               wns=_tf("wns", mt.wns.values.astype(np.float32)),
               tns=_tf("tns", mt.tns.values.astype(np.float32)))
-    ynh, ynd = np.concatenate(ynh), np.concatenate(ynd)
-    ys = dict(net_hpwl=ynh, net_dem=ynd, **gl)
+    ys = dict(net_hpwl=np.concatenate(ynh), **gl)
     for k in TARGETS:
         v = ys[k]; v = v[np.isfinite(v)]
         _NORM[f"y_{k}_m"] = np.float32(v.mean())
@@ -215,8 +216,6 @@ def load_graph(flow_id, device="cpu"):
         # (raw log-means span 2.4..11.2; unstandardized, tot_hpwl swamps the gradient.)
         y_net_hpwl=_z("net_hpwl", torch.log(t(d["net_hpwl"]).clamp(min=1e-6))),
         m_net_hpwl=t(np.isfinite(d["net_hpwl"]) & (d["net_hpwl"] > 0), torch.bool),
-        y_net_dem =_z("net_dem",  torch.log(t(d["net_demand"]).clamp(min=1e-6))),
-        m_net_dem =t(np.isfinite(d["net_demand"]) & (d["net_demand"] > 0), torch.bool),
         y_tot_hpwl=_z("tot_hpwl", t(np.log(max(m.total_hpwl, 1e-6)))),
         y_buf_area=_z("buf_area", t(np.log(max(m.buffer_area, 0) + 1.0))),
         y_buf_cnt =_z("buf_cnt",  t(np.log(max(bufcnt, 0) + 1.0))) if np.isfinite(bufcnt) else t(0.0),
@@ -307,7 +306,7 @@ class FPlace(nn.Module):
         self.norms = nn.ModuleList([nn.LayerNorm(d) for _ in range(K)])
         # --- heads: DE-HNN fc1(d→256)→LeakyReLU→fc2 ; ours output (mu, logvar) ---
         self.fc1_net, self.fc1_glob = Linear(d, 256), Linear(2*d, 256)
-        self.h_net_hpwl, self.h_net_dem = Linear(256, 2), Linear(256, 2)
+        self.h_net_hpwl = Linear(256, 2)
         self.h_tot, self.h_buf_area, self.h_buf_cnt = Linear(256, 2), Linear(256, 2), Linear(256, 2)
         self.h_wns, self.h_tns = Linear(256, 2), Linear(256, 2)     # placement timing (global)
 
@@ -339,7 +338,7 @@ class FPlace(nn.Module):
                 vn = self.mlp_vn[l](vn_t) + vn
         hn = F.leaky_relu(self.fc1_net(h_net))
         hg = F.leaky_relu(self.fc1_glob(torch.cat([h.mean(0), h_net.mean(0)])))
-        return dict(net_hpwl=self.h_net_hpwl(hn), net_dem=self.h_net_dem(hn),
+        return dict(net_hpwl=self.h_net_hpwl(hn),
                     tot_hpwl=self.h_tot(hg), buf_area=self.h_buf_area(hg), buf_cnt=self.h_buf_cnt(hg),
                     wns=self.h_wns(hg), tns=self.h_tns(hg))
 
@@ -396,9 +395,9 @@ def gnll(pred, y, mask=None, nll=True, mode=None):
 
 def loss_fn(out, g):
     L = (gnll(out["net_hpwl"], g["y_net_hpwl"], g["m_net_hpwl"])
-       + gnll(out["net_dem"],  g["y_net_dem"],  g["m_net_dem"])
        + gnll(out["tot_hpwl"], g["y_tot_hpwl"])
-       + gnll(out["buf_area"], g["y_buf_area"]))
+       + gnll(out["buf_area"], g["y_buf_area"])
+       + gnll(out["wns"], g["y_wns"]) + gnll(out["tns"], g["y_tns"]))
     if g["has_bufcnt"]: L = L + gnll(out["buf_cnt"], g["y_buf_cnt"])
     return L
 

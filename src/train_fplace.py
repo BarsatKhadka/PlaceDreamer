@@ -39,7 +39,7 @@ LOSS     = E("LOSS", "decoupled")   # decoupled | beta | nll | mse
 WARMUP   = int(E("WARMUP", 0))      # 0 = off. Only meaningful for LOSS=beta/nll.
 NLL_LR_MULT = float(E("NLL_LR_MULT", 1.0))
 OUT     = E("OUT", f"runs/{ENCODER}")
-W = dict(net_hpwl=float(E("W_NETHPWL",1)), net_dem=float(E("W_NETDEM",1)),
+W = dict(net_hpwl=float(E("W_NETHPWL",1)),
          tot_hpwl=float(E("W_TOT",1)), buf_area=float(E("W_BUFA",1)), buf_cnt=float(E("W_BUFC",1)),
          wns=float(E("W_WNS",1)), tns=float(E("W_TNS",1)))
 torch.manual_seed(SEED); random.seed(SEED); np.random.seed(SEED)
@@ -74,7 +74,6 @@ def flows_of(designs):
 
 def wloss(out, g, nll=True):
     L = (W["net_hpwl"] * gnll(out["net_hpwl"], g["y_net_hpwl"], g["m_net_hpwl"], nll)
-       + W["net_dem"]  * gnll(out["net_dem"],  g["y_net_dem"],  g["m_net_dem"],  nll)
        + W["tot_hpwl"] * gnll(out["tot_hpwl"], g["y_tot_hpwl"], None, nll)
        + W["buf_area"] * gnll(out["buf_area"], g["y_buf_area"], None, nll)
        + W["wns"]      * gnll(out["wns"],      g["y_wns"],      None, nll)
@@ -86,9 +85,9 @@ def wloss(out, g, nll=True):
 def evaluate(model, flows):
     """collect predictions vs truth for every target."""
     model.eval()
-    NET = ("net_hpwl","net_dem")                                    # per-net (masked) heads
-    GLOB = ("tot_hpwl","buf_area","buf_cnt","wns","tns")            # per-flow scalar heads
-    LOGK = ("net_hpwl","net_dem","tot_hpwl","buf_area","buf_cnt")   # log targets -> rel-err via expm1
+    NET = ("net_hpwl",)                                             # per-net (masked) heads
+    GLOB = ("tot_hpwl","buf_area","buf_cnt","wns","tns")           # per-flow scalar heads
+    LOGK = ("net_hpwl","tot_hpwl","buf_area","buf_cnt")            # log targets -> rel-err via expm1
     P = {k: [] for k in NET+GLOB}
     T = {k: [] for k in P}; sig = {k: [] for k in P}; dz = []
     for f in flows:
@@ -156,7 +155,7 @@ def run_fold(fi, test_designs, all_designs):
         opt.step(); opt.zero_grad()
         # val — scored the same way the epoch was trained, PLUS per-target R² so we can
         # watch every placement metric (not just the scalar loss) improve in real time.
-        NETK  = ("net_hpwl","net_dem")
+        NETK  = ("net_hpwl",)
         GLOBK = ("tot_hpwl","buf_area","buf_cnt","wns","tns")
         model.eval(); vl=0.0
         sse={k:0. for k in NETK}; sst={k:0. for k in NETK}
@@ -219,7 +218,7 @@ def eval_ood():
         print(f"  {os.path.basename(ck)}: " + " | ".join(
             f"{k}: R²={v['r2']:.3f} rel={v['rel_err']*100:.1f}%" for k, v in r.items()))
     print("\n=== OOD (ensemble across folds) ===")
-    for k in ("net_hpwl","net_dem","tot_hpwl","buf_area","buf_cnt","wns","tns"):
+    for k in ("net_hpwl","tot_hpwl","buf_area","buf_cnt","wns","tns"):
         r2 = [r[k]["r2"] for r in allres if k in r]
         if r2: print(f"  {k:10} R² = {np.mean(r2):.3f} ± {np.std(r2):.3f}")
     json.dump(allres, open(f"{OUT}/ood_results.json","w"), indent=2)
@@ -233,7 +232,7 @@ def aggregate():
     if not out:
         print(f"no {OUT}/results_fold*.json yet — folds still running?"); return
     print(f"\n=== AGGREGATE across {len(out)} folds (unseen designs) — {OUT} ===")
-    for k in ("net_hpwl","net_dem","tot_hpwl","buf_area","buf_cnt","wns","tns"):
+    for k in ("net_hpwl","tot_hpwl","buf_area","buf_cnt","wns","tns"):
         r2 = [f["metrics"][k]["r2"] for f in out if k in f["metrics"]]
         wr = [f["metrics"][k]["within_r"] for f in out
               if k in f["metrics"] and "within_r" in f["metrics"][k]]
