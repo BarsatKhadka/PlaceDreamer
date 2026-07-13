@@ -184,10 +184,14 @@ def run_fold(fi, test_designs, all_designs):
 
     model = FPlace(d=DIM, K=LAYERS, encoder=ENCODER).to(DEV)
     opt = torch.optim.Adam(model.parameters(), lr=LR)
-    # long runs plateau; halve the LR when val stalls, floor at 1e-5.
+    # Select on validation R², NOT val loss.
+    # The val LOSS is dominated by the NLL variance terms and the readout term, both of which
+    # are spiky per-flow — it swung -2.7 .. +0.35 epoch-to-epoch while every R² sat perfectly
+    # still (hpwl 0.751 unchanged for 50 epochs). Checkpointing on that = selecting on NOISE,
+    # and it was restoring an early lucky-dip epoch and throwing away the trained model.
     sched = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        opt, mode="min", factor=0.5, patience=10, min_lr=1e-5)
-    best, best_state, patience = 1e9, None, 0   # we always KEEP the best-val checkpoint
+        opt, mode="max", factor=0.5, patience=10, min_lr=1e-5)   # max: higher R² is better
+    best, best_state, patience, best_ep = -1e9, None, 0, 0         # best SCORE (R²), not loss
     for ep in range(EPOCHS):
         nll = ep >= WARMUP          # WARMUP=0 by default -> variance head live from step 0
         if WARMUP and ep == WARMUP:
@@ -212,19 +216,26 @@ def run_fold(fi, test_designs, all_designs):
         vl /= max(1,len(val))
         r2 = {k: v["r2"] for k, v in evaluate(model, val).items()}
         g_ = lambda k: r2.get(k, float("nan"))
-        sched.step(vl)
+        # SELECTION SCORE = mean val R² over the targets we actually care about, each clipped
+        # at 0 so one blown-up target can't dominate (a -12 would swamp five good ones).
+        SEL = ("net_hpwl", "tot_hpwl", "buf_area", "buf_cnt", "wns", "tns")
+        vals = [max(0.0, r2[k]) for k in SEL if k in r2 and np.isfinite(r2[k])]
+        score = float(np.mean(vals)) if vals else -1e9
+        sched.step(score)                       # LR now follows R², not the noisy loss
         lr_now = opt.param_groups[0]["lr"]
-        print(f"  ep {ep:3d} [{'nll' if nll else 'mse'}] tr {tot/len(tr):7.3f} vl {vl:7.3f} | "
-              f"R² hpwl {g_('net_hpwl'):+.3f} ep {g_('endpt'):+.3f} tot {g_('tot_hpwl'):+.3f} "
-              f"bufC {g_('buf_cnt'):+.3f} wns {g_('wns'):+.3f} tns {g_('tns'):+.3f} "
-              f"| lr {lr_now:.1e} ({time.time()-t0:.0f}s)", flush=True)
-        if vl < best - 1e-4:
-            best, best_state, patience = vl, {k:v.detach().cpu().clone() for k,v in model.state_dict().items()}, 0
+        print(f"  ep {ep:3d} [{'nll' if nll else 'mse'}] tr {tot/len(tr):7.3f} vl {vl:7.3f} "
+              f"score {score:.4f} | R² hpwl {g_('net_hpwl'):+.3f} ep {g_('endpt'):+.3f} "
+              f"tot {g_('tot_hpwl'):+.3f} bufC {g_('buf_cnt'):+.3f} wns {g_('wns'):+.3f} "
+              f"tns {g_('tns'):+.3f} | lr {lr_now:.1e} ({time.time()-t0:.0f}s)", flush=True)
+        if score > best + 1e-4:
+            best, best_state, patience = score, {k:v.detach().cpu().clone() for k,v in model.state_dict().items()}, 0
+            best_ep = ep
         else:
             patience += 1
             if PATIENCE and patience >= PATIENCE:      # disabled by default (PATIENCE=0)
                 print(f"  early stop (no val improvement in {PATIENCE} epochs)"); break
-    print(f"  done — best val {best:.4f}; restoring best checkpoint", flush=True)
+    print(f"  done — best val R²-score {best:.4f} @ epoch {best_ep}; restoring that checkpoint",
+          flush=True)
     if best_state: model.load_state_dict(best_state)
     torch.save(model.state_dict(), f"{OUT}/fold{fi}.pt")
     res = evaluate(model, te)
