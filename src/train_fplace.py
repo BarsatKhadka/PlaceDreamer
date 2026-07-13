@@ -32,7 +32,10 @@ EPOCHS  = int(E("EPOCHS", 200)); LR = float(E("LR", 1e-3))
 DIM     = int(E("DIM", 64));    LAYERS = int(E("LAYERS", 4))
 ACCUM   = int(E("ACCUM", 8));   SEED = int(E("SEED", 0))
 PATIENCE = int(E("PATIENCE", 0))    # 0 = no early stopping, train all EPOCHS (set >0 to enable)
-WARMUP   = int(E("WARMUP", 20))     # epochs of MSE-on-mean before the variance head turns on
+# Epochs of MSE-on-mean before the variance head engages. 20 was too short — the MSE loss
+# was STILL descending at ep19 (0.2438 and falling), so beta-NLL froze a mean that hadn't
+# converged and the run flatlined at -1.07 from ep21 onward. Let mu actually finish first.
+WARMUP   = int(E("WARMUP", 80))
 BETA     = float(E("BETA", 0.5))    # beta-NLL exponent (Seitzer 2022); 0=plain NLL, 1=MSE grads
 NLL_LR_MULT = float(E("NLL_LR_MULT", 0.2))   # LR drop when the objective switches to NLL
 OUT     = E("OUT", f"runs/{ENCODER}")
@@ -149,16 +152,27 @@ def run_fold(fi, test_designs, all_designs):
                 torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                 opt.step(); opt.zero_grad()
         opt.step(); opt.zero_grad()
-        # val — scored the same way the epoch was trained
-        model.eval(); vl=0.0
+        # val — scored the same way the epoch was trained.
+        # ALSO track val R² on the two heads we actually care about: the scalar loss can
+        # sit flat while mu keeps improving (or rot) and you'd never see it.
+        model.eval(); vl=0.0; sse={"net_dem":0.,"net_hpwl":0.}; sst={"net_dem":0.,"net_hpwl":0.}
         with torch.no_grad():
             for f in val:
-                g = load_graph(f, DEV); vl += wloss(model(g), g, nll).item()
+                g = load_graph(f, DEV); o = model(g)
+                vl += wloss(o, g, nll).item()
+                for k in ("net_dem","net_hpwl"):
+                    m_, y_ = g[f"m_{k}"], g[f"y_{k}"]
+                    if m_.sum() < 3: continue
+                    p_, t_ = o[k][m_,0], y_[m_]
+                    sse[k] += (t_-p_).pow(2).sum().item()
+                    sst[k] += (t_-t_.mean()).pow(2).sum().item()
         vl /= max(1,len(val))
+        r2 = {k: (1 - sse[k]/sst[k]) if sst[k] > 0 else float("nan") for k in sse}
         sched.step(vl)
         lr_now = opt.param_groups[0]["lr"]
         print(f"  ep {ep:3d}  [{'nll' if nll else 'mse'}]  train {tot/len(tr):8.4f}  "
-              f"val {vl:8.4f}  lr {lr_now:.2e}  ({time.time()-t0:.0f}s)", flush=True)
+              f"val {vl:8.4f}  | val R²: dem {r2['net_dem']:+.3f}  hpwl {r2['net_hpwl']:+.3f}  "
+              f"| lr {lr_now:.2e}  ({time.time()-t0:.0f}s)", flush=True)
         if vl < best - 1e-4:
             best, best_state, patience = vl, {k:v.detach().cpu().clone() for k,v in model.state_dict().items()}, 0
         else:
