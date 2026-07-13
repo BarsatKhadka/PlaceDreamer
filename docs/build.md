@@ -202,3 +202,26 @@ WNS. The old global head regressed WNS *directly* so it never had this failure m
 
 Verified locally: soft-min faithful, readout loss backprops to the head (grad-norm 81.6).
 **If v2b also fails → stop patching the target and revisit the architecture properly.**
+
+**v2b RESULT: FAILED (converged, fold 0).** val WNS **−0.59**, val per-endpoint **−0.29**.
+The readout supervision stopped v2's catastrophic collapse (−2.57) but never reached the OLD
+GLOBAL HEAD's +0.92 — and it *destroyed* per-endpoint accuracy (v2 had +0.83). The model games
+the min/sum constraints while getting individual endpoints wrong: worst of both.
+
+**One real finding, though: the SUM constraint works, the MIN readout doesn't.** TNS reached
+**+0.44** (best we've seen) — sums are robust to per-element error. WNS-via-min stays fragile no
+matter how it's supervised, because a minimum is decided by ONE endpoint and nothing forces the
+model to get *that* one right.
+
+### Verdict on target reformulation — STOP.
+Four formulations tried and measured on the same fold:
+| formulation | val WNS | cross-design |
+|---|---|---|
+| global head (v1)               | **+0.92** | −1.9 avg (coverage-limited) |
+| + floorplan anchor             | +0.92 | −0.49 (helped, not enough) |
+| per-endpoint, min-readout (v2) | −2.57 | endpt −0.42 |
+| + readout supervision (v2b)    | −0.59 | — |
+None beat the global head. The target is not the problem — **the architecture is next.**
+Keep from this line of work: (a) the global WNS/TNS heads, (b) the TNS sum-constraint idea,
+(c) per-endpoint slack as an AUXILIARY signal (it learns fine at +0.83 when not fighting the
+readout loss, and f_route will want it).
