@@ -89,3 +89,56 @@ Gradient-boosted trees on {size + knobs}, leave-one-DESIGN-out, all scalar PPA t
   idiosyncratic per design. The one place structure (a timing GNN) or congestion might earn the GNN.
 - **Congestion untested** (RUDY maps were trimmed) — recover via RUDY-from-bbox (now a per-net label).
 → The GNN lives or dies on **congestion + timing**, not wirelength/power.
+
+---
+
+## f_place — first trained result (3-fold leave-designs-out CV, DE-HNN + knob/anchor conditioning)
+
+**Target set (final).** Dropped `net_dem` (per-net RUDY-from-bbox was −0.94 correlated with
+`net_hpwl` — the same bounding box twice, a circular target). f_place now predicts the placement
+state: **per-net HPWL · total HPWL · buffer area · buffer count · WNS · TNS**, each as (μ, logvar).
+
+**3-fold CV on unseen designs (`runs/cv_readout`):**
+| target | R² (mean±std) | within-design r |
+|---|---|---|
+| tot_hpwl | 0.944 ± 0.028 | 0.63 |
+| buf_area | 0.884 ± 0.104 | 0.34 |
+| buf_cnt  | 0.803 ± 0.085 | 0.31 |
+| net_hpwl | 0.518 ± 0.019 | — |
+| wns      | **−1.93 ± 2.31** | **0.83** |
+| tns      | **−4.43 ± 3.77** | **0.87** |
+
+**The finding (measured, not assumed): absolute cross-design timing level is COVERAGE-limited,
+not model-limited.** Per fold, WNS R² = −1.26 / −5.03 / **+0.49**. It is POSITIVE (fold 2, small/mid
+test designs whose level is inside the training span) and catastrophic (fold 1, contains ethernet,
+48k cells — a size EXTRAPOLATION). Same model, same readout; the only variable is interpolation vs
+extrapolation. The ±2–4 std IS the result: timing is learnable, we lack coverage. Confirmed 5 ways:
+GBT baseline (−0.42), the floorplan anchor only half-helped, the slog-residual made it WORSE
+(between-design variance 75%→102%), the variance decomposition (~70% of timing variance is
+between-design), and the fold-2-positive / fold-1-negative split.
+
+**What works:** geometry (tot 0.94), buffers (0.80–0.88), and the timing **knob-response**
+(within-r 0.83–0.87 every fold — the model learned the physics; the RL agent ranks knobs per
+design, so this is most of what it needs). Per-net HPWL 0.52 is a hard, consistent floor.
+
+**Loss / training lessons (all cost a run to learn):**
+- Normalization stats must come from TRAIN designs only, stratified over all of them. Original bug:
+  `sorted(glob)[:40]` = 40 flows of ONE design (ac97) → every design z-scored by ac97's stats.
+- Targets must be standardized (log-means spanned 2.4→11.2; tot_hpwl swamped the gradient).
+- Feature transforms: log1p heavy tails (fanout max 10k), leave indicators raw 0/1 (z-scoring a
+  0.004%-ones binary → +41σ), Laplacian PE raw (unit-L2, bounded), kill dead dims (height const).
+- Plain Gaussian NLL collapses the variance head (d(NLL)/dμ ∝ 1/σ² runaway). Fix = DECOUPLED loss:
+  MSE trains μ, NLL(stopgrad(μ)) trains σ. Both from step 0, no warm-up, no flatline.
+- Global readout for WNS must include MAX-pool (WNS is the WORST path, not a mean) + a direct
+  conditioning skip. This jumped tot 0.75→0.94 and recovered timing within-r 0.39→0.83. But raw
+  max-pool is size/OOD-sensitive → amplifies the extrapolation blowup (candidate fix: attention pool).
+
+**Calibration (σ/rmse) is worst exactly where the model extrapolates** (0.08 on the ethernet fold,
+0.60 when interpolating) — a single model doesn't know it's out-of-distribution. This is the case
+for the ENSEMBLE (epistemic uncertainty = member disagreement), which the grounding loop keys on.
+
+**Next levers (earned, not guessed):** (1) MORE training designs spanning the size/timing range —
+the only thing that moves absolute cross-design timing; (2) ensemble — fixes calibration + gives
+honest OOD uncertainty; (3) attention pooling — tame the max-pool OOD blowup. Congestion stays a
+`data_gen` problem (real target = per-tile RUDY / router demand; EDA-Schema `routability_metrics`
+is empty).
