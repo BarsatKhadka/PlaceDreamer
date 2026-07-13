@@ -42,17 +42,15 @@ def meta():
 # bounding box, two views) — a circular target that proves nothing. Real congestion is a
 # per-TILE field / router quantity, not per-net, and lives on the data_gen path, not here.
 LOG_TARGETS    = ("net_hpwl", "tot_hpwl", "buf_area", "buf_cnt")
-SIGNED_TARGETS = ("wns", "tns")                 # placement timing @ place_resized
-TARGETS        = LOG_TARGETS + SIGNED_TARGETS
-
-def _tf(k, x):
-    """raw target -> base transform (BEFORE standardization). np or torch."""
-    if k == "wns": return x                                    # slack ~[-6, 0.7]: use raw
-    if k == "tns":                                             # <=0, tail to -35446: signed-log
-        neg = (-x).clamp(min=0) if hasattr(x, "clamp") else np.maximum(-x, 0)
-        return -(neg.log1p() if hasattr(neg, "log1p") else np.log1p(neg))
-    # LOG targets handled at their call sites (they already log before _z)
-    return x
+TARGETS        = LOG_TARGETS
+# Timing (WNS/TNS) is NO LONGER a direct global head. Slack lives on ENDPOINTS (register
+# D-pins), so we predict PER-ENDPOINT slack on the cell nodes and READ OUT WNS = min,
+# TNS = sum-of-negatives from those predictions (train_fplace). Per-endpoint slack is
+# intensive (a register's slack is a bounded number regardless of chip size) → transfers
+# across sizes, unlike the extensive global TNS that blew up on extrapolation.
+# v1: register endpoints only (100% node-mapped, covers all high-TNS designs). Primary-
+# output endpoints are dropped here (see scripts/add_endpoint_slack.py) — add via the
+# output-net node in v2 if PO-heavy designs (wb_dma) read out badly.
 
 def _slog(x):
     """signed log1p: sign(x)*log1p(|x|). Handles both signs and crushes the fp_wns tail
@@ -168,14 +166,19 @@ def set_norm(train_designs, force=False):
     mt = m[tr]
     gl = dict(tot_hpwl=np.log(np.maximum(mt.total_hpwl.values, 1e-6)),
               buf_area=np.log(np.maximum(mt.buffer_area.values, 0) + 1.0),
-              buf_cnt =np.log(np.maximum(mt.buffer_count.values, 0) + 1.0),
-              wns=_tf("wns", mt.wns.values.astype(np.float32)),
-              tns=_tf("tns", mt.tns.values.astype(np.float32)))
+              buf_cnt =np.log(np.maximum(mt.buffer_count.values, 0) + 1.0))
     ys = dict(net_hpwl=np.concatenate(ynh), **gl)
     for k in TARGETS:
         v = ys[k]; v = v[np.isfinite(v)]
         _NORM[f"y_{k}_m"] = np.float32(v.mean())
         _NORM[f"y_{k}_s"] = np.float32(v.std() + 1e-6)
+    # per-ENDPOINT slack target: standardize raw slack over train designs' endpoint labels
+    es = []
+    for dsg in sorted(train_designs):
+        for p in sorted(glob.glob(f"{ROOT}/cache/endpt/{dsg}-*.npz"))[::11][:10]:
+            es.append(np.load(p)["ep_slack"])
+    es = np.concatenate(es) if es else np.zeros(1, np.float32)
+    _NORM["y_endpt_m"] = np.float32(es.mean()); _NORM["y_endpt_s"] = np.float32(es.std() + 1e-6)
     # floorplan-timing ANCHOR inputs (conditioning, not targets): signed-log + standardize
     for k in ("fp_wns", "fp_tns"):
         v = _slog(mt[k].values.astype(np.float32)); v = v[np.isfinite(v)]
@@ -235,10 +238,19 @@ def load_graph(flow_id, device="cpu"):
         y_buf_area=_z("buf_area", t(np.log(max(m.buffer_area, 0) + 1.0))),
         y_buf_cnt =_z("buf_cnt",  t(np.log(max(bufcnt, 0) + 1.0))) if np.isfinite(bufcnt) else t(0.0),
         has_bufcnt=bool(np.isfinite(bufcnt)),
-        # placement timing @ place_resized (signed -> _tf, then standardized)
-        y_wns=_z("wns", _tf("wns", t(float(m.wns)))),
-        y_tns=_z("tns", _tf("tns", t(float(m.tns)))),
     )
+    # per-ENDPOINT slack labels (register endpoints @ place_resized), standardized.
+    # y_endpt is per-CELL (0 where no label); m_endpt masks the labeled endpoint cells.
+    ep = np.load(f"{ROOT}/cache/endpt/{flow_id}.npz")
+    y_ep = np.zeros(g["n_cells"], np.float32); mask = np.zeros(g["n_cells"], bool)
+    if len(ep["ep_idx"]):
+        idx = ep["ep_idx"]
+        y_ep[idx] = (ep["ep_slack"] - nm["y_endpt_m"]) / nm["y_endpt_s"]
+        mask[idx] = True
+    g["y_endpt"] = t(y_ep); g["m_endpt"] = t(mask, torch.bool)
+    g["ep_idx"] = torch.tensor(ep["ep_idx"], dtype=torch.long)   # labeled endpoint cells
+    # raw recorded WNS/TNS — for eval readout comparison (complete, untruncated)
+    g["wns_true"] = float(m.wns); g["tns_true"] = float(m.tns)
     return {k: (v.to(device) if torch.is_tensor(v) else v) for k, v in g.items()}
 
 # ---------- DE-HNN HyperConvLayer (verbatim) ----------
@@ -327,10 +339,13 @@ class FPlace(nn.Module):
         # ~48k others. max-pool exposes it. The ctx skip lets clock_period + the floorplan
         # anchor reach WNS/TNS directly instead of surviving VN->graph->pool dilution.
         self.fc1_net  = Linear(d, 256)
+        self.fc1_cell = Linear(d + d, 256)            # per-cell readout: [cell embedding, ctx skip]
         self.fc1_glob = Linear(4*d + d, 256)          # [h.mean,h.max,hn.mean,hn.max, ctx]
         self.h_net_hpwl = Linear(256, 2)
         self.h_tot, self.h_buf_area, self.h_buf_cnt = Linear(256, 2), Linear(256, 2), Linear(256, 2)
-        self.h_wns, self.h_tns = Linear(256, 2), Linear(256, 2)     # placement timing (global)
+        # per-ENDPOINT slack head (per-cell). WNS=min, TNS=sum-neg are READOUTS, not heads.
+        # ctx skip so clock_period + the floorplan anchor reach each endpoint's slack directly.
+        self.h_endpt = Linear(256, 2)
 
     def forward(self, g):
         h     = self.node_encoder(g["cell_x"]) + self.type_emb(g["cell_type"])
@@ -359,11 +374,12 @@ class FPlace(nn.Module):
                                   scatter(h, part, 0, dim_size=nvn, reduce="max")], 1)
                 vn = self.mlp_vn[l](vn_t) + vn
         hn = F.leaky_relu(self.fc1_net(h_net))
+        hc = F.leaky_relu(self.fc1_cell(torch.cat([h, ctx.expand(h.size(0), -1)], 1)))  # per-cell
         hg = F.leaky_relu(self.fc1_glob(torch.cat([
             h.mean(0), h.max(0).values, h_net.mean(0), h_net.max(0).values, ctx])))
         return dict(net_hpwl=self.h_net_hpwl(hn),
                     tot_hpwl=self.h_tot(hg), buf_area=self.h_buf_area(hg), buf_cnt=self.h_buf_cnt(hg),
-                    wns=self.h_wns(hg), tns=self.h_tns(hg))
+                    endpt=self.h_endpt(hc))          # per-cell slack; WNS/TNS read out in train
 
 LOSS   = os.environ.get("LOSS", "decoupled")     # decoupled | beta | nll | mse
 BETA   = float(os.environ.get("BETA", 0.5))      # for LOSS=beta
@@ -420,7 +436,7 @@ def loss_fn(out, g):
     L = (gnll(out["net_hpwl"], g["y_net_hpwl"], g["m_net_hpwl"])
        + gnll(out["tot_hpwl"], g["y_tot_hpwl"])
        + gnll(out["buf_area"], g["y_buf_area"])
-       + gnll(out["wns"], g["y_wns"]) + gnll(out["tns"], g["y_tns"]))
+       + gnll(out["endpt"], g["y_endpt"], g["m_endpt"]))
     if g["has_bufcnt"]: L = L + gnll(out["buf_cnt"], g["y_buf_cnt"])
     return L
 

@@ -142,3 +142,41 @@ the only thing that moves absolute cross-design timing; (2) ensemble — fixes c
 honest OOD uncertainty; (3) attention pooling — tame the max-pool OOD blowup. Congestion stays a
 `data_gen` problem (real target = per-tile RUDY / router demand; EDA-Schema `routability_metrics`
 is empty).
+
+---
+
+## f_place v2 — timing reformulated as PER-ENDPOINT slack (WNS/TNS become readouts)
+
+**Why.** v1 predicted WNS/TNS as two global scalar heads. TNS is *extensive* (a sum over the
+whole chip) → on OOD-large designs the magnitude is unseen → catastrophic extrapolation
+(tns R²=−8.98 on the ethernet fold). Root cause: timing LEVEL is between-design idiosyncratic
+and the head regresses an unbounded total.
+
+**Reformulation.** Slack physically lives on ENDPOINTS (register D-pins), not the whole chip.
+So predict **per-endpoint slack** on the cell nodes (a per-cell masked head, like per-net HPWL),
+and **read out WNS = min, TNS = sum-of-negatives** from those predictions. Per-endpoint slack is
+*intensive* — a register's slack is a bounded number regardless of chip size → transfers across
+sizes; the global heads are gone.
+
+**Data (validated before building).**
+- `scripts/add_endpoint_slack.py` → `cache/endpt/{flow}.npz` = `ep_idx` (endpoint cell indices),
+  `ep_slack` (worst setup slack per endpoint) @ place_resized. 1944 flows, ~745 endpoints/flow.
+- Source = `timing_paths` (setup, worst-per-endpoint). Register endpoints map to floorplan
+  cells **100%** across all 18 designs (join by cell name, no graph rebuild).
+- **WNS reconstructs EXACTLY** from these on all 18 (worst path always in the report).
+- **TNS reconstruction is truncated** (`timing_paths` is a top-N report): 9–100% coverage
+  (ethernet 32%, mem_ctrl 9%, jpeg 99%). So the per-endpoint sum UNDERCOUNTS TNS on some
+  designs — a known v1 limitation; v2b can add the recorded-total (complete) as an aggregate
+  sum-constraint in the loss to close it.
+- **Primary-output endpoints** (0 in most designs; ~50% in wb_dma) are NOT cell nodes → dropped
+  in v1. They can set WNS on I/O-heavy designs (wb_dma: worst is a PO). Add via the output-net
+  node in v2 if PO-heavy designs read out badly. The high-TNS designs are 0% PO, so v1 covers them.
+
+**Code.** fplace: dropped `h_wns`/`h_tns`; added `h_endpt` (per-cell, ctx-skip readout) + slack
+norm stats; `load_graph` loads endpoint labels (`y_endpt`,`m_endpt`,`ep_idx`) + raw recorded
+`wns_true`/`tns_true` for eval. train: `evaluate()` computes per-endpoint R²/calib AND reads out
+per-flow WNS(min)/TNS(sum-neg) vs recorded. Loss weight `W_ENDPT`. NOT yet run on the cluster.
+
+**Open question for the run:** does WNS(min-readout) now transfer better than the old global
+head, and does TNS undercount as the coverage table predicts? The numbers decide v2b (aggregate
+constraint) and v2c (PO endpoints).
