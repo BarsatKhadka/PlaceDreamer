@@ -39,6 +39,73 @@ def meta():
 # would let tot_hpwl dominate the gradient purely because of its units.
 TARGETS = ("net_hpwl", "net_dem", "tot_hpwl", "buf_area", "buf_cnt")
 
+# ---------- feature pre-transform (BEFORE z-scoring) ----------
+# Unbounded non-negative magnitudes get log1p first: they have brutal right tails
+# (net fanout on ethernet: mean 3.2, MAX 10,016 — a clock net; out_cap_max: mean 72,
+# max 2,050). Z-scoring those raw leaves a few nodes at +50 sigma and crushes the rest.
+# Bounded/indicator dims (flags, fractions, drive strength, w/h, PE) are left alone.
+#   cell_x 15: 0 w, 1 h, 2 n_in, 3 n_out, 4 seq, 5 inv, 6 buf, 7 fill, 8 diode,
+#              9 drive, 10 in_cap, 11 out_cap, 12 leak, 13 area, 14 degree   (+10 PE = 25)
+LOG_CELL = [9, 10, 11, 12, 13, 14]              # drive, caps, leakage, area, degree
+LOG_NET  = [0]                                  # fanout
+
+# Indicator dims are left as raw 0/1 — NEVER z-scored. z-scoring a rare binary divides
+# by a tiny std and detonates: is_buf (0.004% of cells) hit +41 sigma, is_reset +80 sigma.
+IDENT_CELL = [4, 5, 6, 7, 8]                    # is_seq/inv/buf/filler/diode
+IDENT_NET  = [1, 2, 3]                          # is_io/is_clock/is_reset
+IDENT_DF   = [4, 5, 6, 7, 8, 12, 13, 14]        # frac_* (already in [0,1])
+PE_SLICE   = slice(15, 25)                      # the 10 Laplacian PE dims of cell_x
+#   design_features 18 (insertion order in build_graph.py):
+#     0 n_cells 1 n_nets 2 n_pins 3 total_cell_area 4-8 frac_* 9 fanout_mean
+#     10 fanout_max 11 fanout_p90 12-14 frac_*pin 15 clock_fanout 16 n_clock 17 n_reset
+LOG_DF   = [0, 1, 2, 3, 9, 10, 11, 15, 16, 17]  # counts / areas / fanout magnitudes
+
+def _pre(a, idx):
+    """log1p the heavy-tailed magnitude dims; leave flags/fractions/PE alone."""
+    a = np.array(a, np.float32, copy=True)
+    if a.ndim == 1:
+        a[idx] = np.log1p(np.maximum(a[idx], 0))
+    else:
+        a[:, idx] = np.log1p(np.maximum(a[:, idx], 0))
+    return a
+
+def _stats(a, ident=()):
+    """mean/std for z-scoring, with two guards.
+
+    dead dims: a CONSTANT feature must be neutralized, not divided by ~1e-6.
+      `height` is the same for every sky130 std cell (it IS the std-cell row height),
+      is_filler/is_diode are all-zero at floorplan. The threshold is RELATIVE
+      (s < 1e-6*(|m|+1)) — height's std is 2.4e-07 against a mean of 2.72, which an
+      absolute 1e-6 threshold misses, leaving it to emit a constant 1.0 from float dust.
+    ident dims: indicators pass through untouched (m=0, s=1) — see IDENT_* above.
+    """
+    m, s = a.mean(0), a.std(0)
+    dead = s < 1e-6 * (np.abs(m) + 1.0)
+    m = np.where(dead, 0.0, m); s = np.where(dead, 1.0, s + 1e-6)
+    if len(ident):
+        m[list(ident)] = 0.0; s[list(ident)] = 1.0
+    return m.astype(np.float32), s.astype(np.float32), dead
+
+def _cellfeat(d):
+    """cell_x (15) ++ per-design-standardized Laplacian PE (10) -> (C,25).
+    Single source of truth: set_norm() and load_graph() BOTH go through this, so the
+    stats can never drift from what the model is actually fed."""
+    return np.nan_to_num(np.concatenate([d["cell_x"], _pe_norm(d["pe_cell"])], 1))
+
+def _pe_norm(pe):
+    """Laplacian PE: passed through RAW, exactly as DE-HNN does. Do not "normalize" it.
+
+    eigsh returns unit-L2 eigenvectors, so every entry is already bounded in [-1,1]
+    (observed max 0.596) — they need no scaling. Two things we tried and reverted:
+      * global z-score across designs  -> +61 sigma outliers (PE scale ~1/sqrt(n_cells),
+        so a 48k-cell design and a 575-cell one are on different scales; pooling their
+        stats is meaningless).
+      * per-design std standardization -> +138 sigma. WORSE: eigenvectors on large sparse
+        graphs localize on a few nodes, so dividing by std inflates exactly those spikes.
+    Raw is bounded, cross-design-consistent, and what the paper feeds. Leave it alone.
+    """
+    return np.nan_to_num(np.asarray(pe, np.float32))
+
 def set_norm(train_designs, force=False):
     """Build feature + target normalization from TRAINING designs ONLY.
 
@@ -59,15 +126,23 @@ def set_norm(train_designs, force=False):
         fl = sorted(glob.glob(f"{CACHE}/{dsg}-*.npz"))
         for p in fl[:2]:                                    # graph feats barely move with knobs
             d = np.load(p, allow_pickle=True)
-            cx.append(np.nan_to_num(np.concatenate([d["cell_x"], d["pe_cell"]], 1)))
-            nx.append(d["net_x"]); df.append(d["df_vals"])
+            cx.append(_pre(_cellfeat(d), LOG_CELL))
+            nx.append(_pre(d["net_x"], LOG_NET)); df.append(_pre(d["df_vals"], LOG_DF))
         for p in fl[::11][:10]:                             # per-net targets DO move with knobs
             d = np.load(p, allow_pickle=True)
             a = d["net_hpwl"];   ynh.append(np.log(a[np.isfinite(a) & (a > 0)]))
             b = d["net_demand"]; ynd.append(np.log(b[np.isfinite(b) & (b > 0)]))
     cx, nx, df = np.concatenate(cx), np.concatenate(nx), np.stack(df)
-    _NORM = dict(cx_m=cx.mean(0), cx_s=cx.std(0)+1e-6, nx_m=nx.mean(0), nx_s=nx.std(0)+1e-6,
-                 df_m=df.mean(0), df_s=df.std(0)+1e-6)
+    cx_m, cx_s, cx_d = _stats(cx, IDENT_CELL)
+    nx_m, nx_s, nx_d = _stats(nx, IDENT_NET)
+    df_m, df_s, df_d = _stats(df, IDENT_DF)
+    cx_m[PE_SLICE] = 0.0; cx_s[PE_SLICE] = 1.0     # PE passes through RAW (see _pe_norm)
+    _NORM = dict(cx_m=cx_m, cx_s=cx_s, nx_m=nx_m, nx_s=nx_s, df_m=df_m, df_s=df_s)
+    n_dead = int(cx_d.sum() + nx_d.sum() + df_d.sum())
+    if n_dead:
+        print(f"[norm] {n_dead} constant/dead feature dims zeroed "
+              f"(cell {list(np.where(cx_d)[0])}, net {list(np.where(nx_d)[0])}, "
+              f"design {list(np.where(df_d)[0])})")
 
     # global targets: read straight off meta (free), train designs only
     m = meta(); tr = m.index.str.replace(r"-\d+$", "", regex=True).isin(set(train_designs))
@@ -107,9 +182,10 @@ def load_graph(flow_id, device="cpu"):
     ed = torch.tensor(d["edge_driver"], dtype=torch.long)
     es = torch.tensor(d["edge_sink"],   dtype=torch.long)
     t  = lambda a, dt=torch.float: torch.tensor(np.asarray(a), dtype=dt)
-    cell_x = (np.nan_to_num(np.concatenate([d["cell_x"], d["pe_cell"]], 1)) - nm["cx_m"]) / nm["cx_s"]
-    net_x  = (d["net_x"]  - nm["nx_m"]) / nm["nx_s"]
-    dfeat  = (d["df_vals"] - nm["df_m"]) / nm["df_s"]
+    # log1p the heavy-tailed magnitude dims, THEN z-score (train-fold stats). Must match set_norm().
+    cell_x = (_pre(_cellfeat(d), LOG_CELL) - nm["cx_m"]) / nm["cx_s"]
+    net_x  = (_pre(d["net_x"],  LOG_NET) - nm["nx_m"]) / nm["nx_s"]
+    dfeat  = (_pre(d["df_vals"], LOG_DF) - nm["df_m"]) / nm["df_s"]
     knb    = np.array([m.clock_period/10.0, m.utilization/30.0, m.aspect_ratio], np.float32)
     part_c = torch.tensor(d["part_cell"], dtype=torch.long)      # DE-HNN: VN over CELLS
     bufcnt = float(getattr(m, "buffer_count", np.nan))
