@@ -32,12 +32,12 @@ EPOCHS  = int(E("EPOCHS", 200)); LR = float(E("LR", 1e-3))
 DIM     = int(E("DIM", 64));    LAYERS = int(E("LAYERS", 4))
 ACCUM   = int(E("ACCUM", 8));   SEED = int(E("SEED", 0))
 PATIENCE = int(E("PATIENCE", 0))    # 0 = no early stopping, train all EPOCHS (set >0 to enable)
-# Epochs of MSE-on-mean before the variance head engages. 20 was too short — the MSE loss
-# was STILL descending at ep19 (0.2438 and falling), so beta-NLL froze a mean that hadn't
-# converged and the run flatlined at -1.07 from ep21 onward. Let mu actually finish first.
-WARMUP   = int(E("WARMUP", 80))
-BETA     = float(E("BETA", 0.5))    # beta-NLL exponent (Seitzer 2022); 0=plain NLL, 1=MSE grads
-NLL_LR_MULT = float(E("NLL_LR_MULT", 0.2))   # LR drop when the objective switches to NLL
+# LOSS=decoupled (default): mean and variance train TOGETHER from step 0, but the mean's
+# gradient never passes through sigma^2 (see fplace.gnll). No warm-up phase needed — the
+# phased MSE->NLL switch was what froze the mean and flatlined the run at ep21.
+LOSS     = E("LOSS", "decoupled")   # decoupled | beta | nll | mse
+WARMUP   = int(E("WARMUP", 0))      # 0 = off. Only meaningful for LOSS=beta/nll.
+NLL_LR_MULT = float(E("NLL_LR_MULT", 1.0))
 OUT     = E("OUT", f"runs/{ENCODER}")
 W = dict(net_hpwl=float(E("W_NETHPWL",1)), net_dem=float(E("W_NETDEM",1)),
          tot_hpwl=float(E("W_TOT",1)), buf_area=float(E("W_BUFA",1)), buf_cnt=float(E("W_BUFC",1)))
@@ -133,15 +133,11 @@ def run_fold(fi, test_designs, all_designs):
         opt, mode="min", factor=0.5, patience=10, min_lr=1e-5)
     best, best_state, patience = 1e9, None, 0   # we always KEEP the best-val checkpoint
     for ep in range(EPOCHS):
-        nll = ep >= WARMUP          # MSE on the mean first; variance head only once mu is sane
-        if ep == WARMUP:
-            # the objective changes here, so the loss VALUE is not comparable across this
-            # boundary: restart best-tracking, and drop the LR (a 1e-3 step that was fine
-            # for MSE destabilizes beta-NLL, which has the extra logvar term to fit).
+        nll = ep >= WARMUP          # WARMUP=0 by default -> variance head live from step 0
+        if WARMUP and ep == WARMUP:
             for pg in opt.param_groups: pg["lr"] = LR * NLL_LR_MULT
-            sched._reset() if hasattr(sched, "_reset") else None
-            best, patience = 1e9, 0
-            print(f"  --- epoch {ep}: beta-NLL on (beta={BETA}), lr -> {LR*NLL_LR_MULT:.1e} ---", flush=True)
+            best, patience = 1e9, 0     # objective changed; loss value not comparable across it
+            print(f"  --- epoch {ep}: variance head on, lr -> {LR*NLL_LR_MULT:.1e} ---", flush=True)
         model.train(); rng.shuffle(tr); t0=time.time(); tot=0.0
         opt.zero_grad()
         for i, f in enumerate(tr):

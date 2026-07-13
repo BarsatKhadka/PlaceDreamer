@@ -324,35 +324,55 @@ class FPlace(nn.Module):
         return dict(net_hpwl=self.h_net_hpwl(hn), net_dem=self.h_net_dem(hn),
                     tot_hpwl=self.h_tot(hg), buf_area=self.h_buf_area(hg), buf_cnt=self.h_buf_cnt(hg))
 
-BETA = float(os.environ.get("BETA", 0.5))   # beta-NLL exponent; 0 = plain NLL, 1 = MSE gradients
+LOSS   = os.environ.get("LOSS", "decoupled")     # decoupled | beta | nll | mse
+BETA   = float(os.environ.get("BETA", 0.5))      # for LOSS=beta
+LAM_V  = float(os.environ.get("LAM_VAR", 1.0))   # weight on the variance term (decoupled)
 
-def gnll(pred, y, mask=None, nll=True, beta=None):
-    """beta-NLL (Seitzer et al. 2022, "On the Pitfalls of Heteroscedastic Uncertainty
-    Estimation") on standardized targets.
+def gnll(pred, y, mask=None, nll=True, mode=None):
+    """Mean + variance, trained TOGETHER but DECOUPLED (the default).
 
-    nll=False -> plain MSE on the mean (warm-up; variance head ignored).
+        L = MSE(mu, y)  +  lam * NLL(stopgrad(mu), sigma^2, y)
 
-    WHY beta-NLL and not plain Gaussian NLL:
-      d(NLL)/d(mu) is scaled by 1/sigma^2. So the model shrinks sigma on points it already
-      fits, which AMPLIFIES their gradient, which shrinks sigma further — a runaway loop.
-      It bottoms out at the logvar clamp and every miss is then divided by exp(-5), so the
-      loss detonates. We watched exactly this twice:
-        no warm-up:   ep1  train -0.13  val 27.6
-        MSE warm-up:  ep20 train -5.98  val 62.4   (mean was FINE at mse 0.24 — not the cause)
-      beta-NLL multiplies each point's loss by a DETACHED sigma^(2*beta), cancelling that
-      1/sigma^2 amplification. beta=0.5 is the paper's recommendation: keeps calibrated
-      uncertainty, but the mean trains with near-MSE-stable gradients.
+    The whole pathology of Gaussian NLL is one term: d(NLL)/d(mu) = -(y-mu)/sigma^2.
+    The mean's gradient is DIVIDED by the variance, so the model shrinks sigma on points
+    it already fits, which amplifies exactly those points' gradient, which shrinks sigma
+    further. Easy points drown out hard ones; the mean stops learning; then one bad val
+    point gets divided by exp(-5) and the loss detonates. Observed twice:
+        plain NLL:       ep1  train  -0.13  val  27.6
+        + MSE warm-up:   ep20 train  -5.98  val  62.4  -> 161.9 / 228.1
+    (the warm-up did NOT save it — mu was healthy at mse 0.24 when NLL engaged, proving
+     the fault is the objective's shape, not a bad starting mean.)
+
+    Decoupling removes that term outright:
+      * mu   trains on pure MSE, every epoch, forever. No 1/sigma^2 factor exists in its
+             gradient, so there is no runaway to fall into. Stable by construction.
+      * sigma trains on NLL against a DETACHED mu, i.e. it learns to predict the residual
+             magnitude (y-mu)^2 — which IS the calibrated uncertainty we want for the
+             grounding loop. It cannot move mu, so it cannot sabotage it.
+    No warm-up, no phase switch, no LR drop, no flatline. Both heads learn from step 0.
+
+    Other modes kept for ablation: beta (Seitzer 2022), nll (broken, for the record), mse.
     """
-    beta = BETA if beta is None else beta
+    mode = (LOSS if mode is None else mode)
+    if not nll: mode = "mse"                       # warm-up override, if anyone sets WARMUP
     mu, lv = pred[..., 0], pred[..., 1].clamp(-5, 5)
     if mask is not None:
         if mask.sum() == 0: return torch.zeros((), device=mu.device)
         mu, lv, y = mu[mask], lv[mask], y[mask]
+
+    if mode == "mse":
+        return 0.5 * (y - mu).pow(2).mean()
+
+    if mode == "decoupled":
+        mean_loss = 0.5 * (y - mu).pow(2).mean()               # trains mu ONLY
+        se_d      = (y - mu.detach()).pow(2)                   # mu detached -> trains lv ONLY
+        var_loss  = 0.5 * (lv + se_d / lv.exp()).mean()
+        return mean_loss + LAM_V * var_loss
+
     se = (y - mu).pow(2)
-    if not nll: return 0.5 * se.mean()
-    l = 0.5 * (lv + se / lv.exp())
-    if beta > 0:
-        l = l * lv.mul(beta).exp().detach()      # stopgrad(sigma^(2*beta))
+    l  = 0.5 * (lv + se / lv.exp())
+    if mode == "beta":
+        l = l * lv.mul(BETA).exp().detach()        # stopgrad(sigma^(2*beta))
     return l.mean()
 
 def loss_fn(out, g):
