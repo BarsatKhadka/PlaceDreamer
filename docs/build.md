@@ -180,3 +180,25 @@ per-flow WNS(min)/TNS(sum-neg) vs recorded. Loss weight `W_ENDPT`. NOT yet run o
 **Open question for the run:** does WNS(min-readout) now transfer better than the old global
 head, and does TNS undercount as the coverage table predicts? The numbers decide v2b (aggregate
 constraint) and v2c (PO endpoints).
+
+### v2b — supervise the READOUTS directly (soft-min WNS + sum-constraint TNS)
+
+**v2 result (fold 0, `runs/probe_endpt`):** per-endpoint slack LEARNS (val ep R²=0.83) but the
+readouts collapsed — val WNS R² = **−2.57** (was +0.92 with the old global head), and on unseen
+designs `endpt` itself was −0.42.
+
+**Diagnosis: `min` is a fragile readout.** Endpoints trained to be right ON AVERAGE don't protect
+an EXTREME statistic — one endpoint predicted too-negative becomes a spurious minimum and tanks
+WNS. The old global head regressed WNS *directly* so it never had this failure mode.
+
+**v2b fix — train the readout, not just the average:**
+- `L += (softmin_TAU(pred endpoint slacks) − recorded_WNS)²`. Hard `min` gives gradient to ONE
+  endpoint; **soft-min** (temperature-weighted, TAU=0.1) spreads it over every near-worst endpoint.
+  Verified soft-min tracks hard min to 0.007–0.03. Eval still reports the TRUE hard min.
+- `L += (slog(Σ neg pred slacks) − slog(recorded_TNS))²`. The per-endpoint LABELS are truncated
+  (ethernet: 32% of violations), but the RECORDED TNS is complete → this term supervises the
+  endpoints that have no individual label. That is its entire purpose.
+- Weights `W_WNS_RO` / `W_TNS_RO` (default 1), `TAU` env-tunable.
+
+Verified locally: soft-min faithful, readout loss backprops to the head (grad-norm 81.6).
+**If v2b also fails → stop patching the target and revisit the architecture properly.**

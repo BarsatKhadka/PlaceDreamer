@@ -23,7 +23,7 @@ import os, sys, glob, json, time, random
 import numpy as np, pandas as pd, torch
 from scipy.stats import pearsonr
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from fplace import FPlace, load_graph, loss_fn, gnll, meta, CACHE, set_norm, denorm
+from fplace import FPlace, load_graph, loss_fn, gnll, meta, CACHE, set_norm, denorm, norm
 
 E = os.environ.get
 DEV     = "cuda" if torch.cuda.is_available() else "cpu"
@@ -41,7 +41,15 @@ NLL_LR_MULT = float(E("NLL_LR_MULT", 1.0))
 OUT     = E("OUT", f"runs/{ENCODER}")
 W = dict(net_hpwl=float(E("W_NETHPWL",1)),
          tot_hpwl=float(E("W_TOT",1)), buf_area=float(E("W_BUFA",1)), buf_cnt=float(E("W_BUFC",1)),
-         endpt=float(E("W_ENDPT",1)))               # per-endpoint slack (WNS/TNS read out from it)
+         endpt=float(E("W_ENDPT",1)),               # per-endpoint slack
+         # v2b: supervise the READOUTS directly, not just the per-endpoint mean.
+         # v2 trained endpoints to be right ON AVERAGE (val ep R²=0.83) but WNS=min collapsed
+         # (val −2.57): min depends on ONE endpoint, so average accuracy doesn't protect it —
+         # a single too-negative prediction becomes a spurious minimum. These terms make being
+         # wrong on the worst/summed endpoints cost loss directly.
+         wns_ro=float(E("W_WNS_RO", 1)),            # soft-min(pred endpoints)  vs recorded WNS
+         tns_ro=float(E("W_TNS_RO", 1)))            # sum(neg pred endpoints)   vs recorded TNS
+TAU = float(E("TAU", 0.1))   # soft-min temperature (smaller = closer to hard min)
 torch.manual_seed(SEED); random.seed(SEED); np.random.seed(SEED)
 os.makedirs(OUT, exist_ok=True)
 
@@ -72,11 +80,40 @@ def flows_of(designs):
     idx = meta().index
     return [f for f in idx if f.rsplit("-", 1)[0] in set(designs)]
 
+def _slog_t(x):
+    """signed log1p (torch) — compresses the TNS tail (to -35k) so its loss is commensurate."""
+    return torch.sign(x) * torch.log1p(torch.abs(x))
+
+def readout_loss(out, g):
+    """v2b: supervise WNS/TNS READOUTS from the per-endpoint predictions.
+
+    WNS = min over endpoints. `min` gives gradient to only ONE endpoint, so we train with a
+    SOFT-min (temperature-weighted average, TAU) — gradient reaches every near-worst endpoint,
+    which is exactly the fragility that sank v2 (one bad prediction = spurious minimum).
+    Eval still reports the TRUE hard min, so the number stays honest.
+
+    TNS = sum of negative slacks. The per-endpoint LABELS are truncated (timing_paths is
+    top-N: ethernet has only 32% of its violations), but the RECORDED TNS is complete — so
+    this term supervises the endpoints we have no individual label for. That's its whole job.
+    """
+    ep = g["ep_idx"]
+    if len(ep) < 2: return torch.zeros((), device=out["endpt"].device)
+    n = norm()
+    slk = out["endpt"][ep, 0] * float(n["y_endpt_s"]) + float(n["y_endpt_m"])   # -> raw slack
+    # soft-min: sum_i w_i * s_i,  w = softmax(-s/TAU)  (differentiable min)
+    wns_p = (torch.softmax(-slk / TAU, dim=0) * slk).sum()
+    tns_p = torch.clamp(slk, max=0.0).sum()                                     # sum of negatives
+    Lw = (wns_p - float(g["wns_true"])).pow(2)                                  # WNS ~[-6,1]: raw
+    Lt = (_slog_t(tns_p) - _slog_t(torch.tensor(float(g["tns_true"]),
+                                                device=slk.device))).pow(2)     # TNS: signed-log
+    return W["wns_ro"] * Lw + W["tns_ro"] * Lt
+
 def wloss(out, g, nll=True):
     L = (W["net_hpwl"] * gnll(out["net_hpwl"], g["y_net_hpwl"], g["m_net_hpwl"], nll)
        + W["tot_hpwl"] * gnll(out["tot_hpwl"], g["y_tot_hpwl"], None, nll)
        + W["buf_area"] * gnll(out["buf_area"], g["y_buf_area"], None, nll)
-       + W["endpt"]    * gnll(out["endpt"],    g["y_endpt"],    g["m_endpt"], nll))
+       + W["endpt"]    * gnll(out["endpt"],    g["y_endpt"],    g["m_endpt"], nll)
+       + readout_loss(out, g))
     if g["has_bufcnt"]: L = L + W["buf_cnt"] * gnll(out["buf_cnt"], g["y_buf_cnt"], None, nll)
     return L
 
