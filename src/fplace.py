@@ -320,7 +320,14 @@ class FPlace(nn.Module):
         self.convs = nn.ModuleList([mk() for _ in range(K)])
         self.norms = nn.ModuleList([nn.LayerNorm(d) for _ in range(K)])
         # --- heads: DE-HNN fc1(d→256)→LeakyReLU→fc2 ; ours output (mu, logvar) ---
-        self.fc1_net, self.fc1_glob = Linear(d, 256), Linear(2*d, 256)
+        # per-net head: DE-HNN-exact (reads net embedding directly).
+        # GLOBAL head readout (OURS, not DE-HNN): mean+MAX pool of cells & nets, PLUS a direct
+        # conditioning skip. Rationale — WNS is the WORST slack (an extreme, dominated by ONE
+        # critical path) and TNS is a SUM; mean-pool alone washes the critical cell out among
+        # ~48k others. max-pool exposes it. The ctx skip lets clock_period + the floorplan
+        # anchor reach WNS/TNS directly instead of surviving VN->graph->pool dilution.
+        self.fc1_net  = Linear(d, 256)
+        self.fc1_glob = Linear(4*d + d, 256)          # [h.mean,h.max,hn.mean,hn.max, ctx]
         self.h_net_hpwl = Linear(256, 2)
         self.h_tot, self.h_buf_area, self.h_buf_cnt = Linear(256, 2), Linear(256, 2), Linear(256, 2)
         self.h_wns, self.h_tns = Linear(256, 2), Linear(256, 2)     # placement timing (global)
@@ -352,7 +359,8 @@ class FPlace(nn.Module):
                                   scatter(h, part, 0, dim_size=nvn, reduce="max")], 1)
                 vn = self.mlp_vn[l](vn_t) + vn
         hn = F.leaky_relu(self.fc1_net(h_net))
-        hg = F.leaky_relu(self.fc1_glob(torch.cat([h.mean(0), h_net.mean(0)])))
+        hg = F.leaky_relu(self.fc1_glob(torch.cat([
+            h.mean(0), h.max(0).values, h_net.mean(0), h_net.max(0).values, ctx])))
         return dict(net_hpwl=self.h_net_hpwl(hn),
                     tot_hpwl=self.h_tot(hg), buf_area=self.h_buf_area(hg), buf_cnt=self.h_buf_cnt(hg),
                     wns=self.h_wns(hg), tns=self.h_tns(hg))
