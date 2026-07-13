@@ -54,6 +54,11 @@ def _tf(k, x):
     # LOG targets handled at their call sites (they already log before _z)
     return x
 
+def _slog(x):
+    """signed log1p: sign(x)*log1p(|x|). Handles both signs and crushes the fp_wns tail
+    (floorplan slacks run to -85). Used for the floorplan-timing ANCHOR inputs."""
+    return np.sign(x) * np.log1p(np.abs(x))
+
 # ---------- feature pre-transform (BEFORE z-scoring) ----------
 # Unbounded non-negative magnitudes get log1p first: they have brutal right tails
 # (net fanout on ethernet: mean 3.2, MAX 10,016 — a clock net; out_cap_max: mean 72,
@@ -171,6 +176,10 @@ def set_norm(train_designs, force=False):
         v = ys[k]; v = v[np.isfinite(v)]
         _NORM[f"y_{k}_m"] = np.float32(v.mean())
         _NORM[f"y_{k}_s"] = np.float32(v.std() + 1e-6)
+    # floorplan-timing ANCHOR inputs (conditioning, not targets): signed-log + standardize
+    for k in ("fp_wns", "fp_tns"):
+        v = _slog(mt[k].values.astype(np.float32)); v = v[np.isfinite(v)]
+        _NORM[f"a_{k}_m"] = np.float32(v.mean()); _NORM[f"a_{k}_s"] = np.float32(v.std() + 1e-6)
     np.savez(f, **_NORM)
     print(f"[norm] built from {len(train_designs)} TRAIN designs → {os.path.basename(f)}")
     for k in TARGETS:
@@ -201,7 +210,13 @@ def load_graph(flow_id, device="cpu"):
     cell_x = (_pre(_cellfeat(d), LOG_CELL) - nm["cx_m"]) / nm["cx_s"]
     net_x  = (_pre(d["net_x"],  LOG_NET) - nm["nx_m"]) / nm["nx_s"]
     dfeat  = (_pre(d["df_vals"], LOG_DF) - nm["df_m"]) / nm["df_s"]
-    knb    = np.array([m.clock_period/10.0, m.utilization/30.0, m.aspect_ratio], np.float32)
+    # knobs + FLOORPLAN-TIMING ANCHOR (fp_wns/fp_tns). The anchor gives the model the
+    # design's baseline timing LEVEL — the part that doesn't transfer cross-design and
+    # tanked WNS to R²=-0.77 without it. Leakage-free: floorplan is BEFORE placement.
+    a_wns = (_slog(float(m.fp_wns)) - nm["a_fp_wns_m"]) / nm["a_fp_wns_s"]
+    a_tns = (_slog(float(m.fp_tns)) - nm["a_fp_tns_m"]) / nm["a_fp_tns_s"]
+    knb    = np.array([m.clock_period/10.0, m.utilization/30.0, m.aspect_ratio,
+                       a_wns, a_tns], np.float32)
     part_c = torch.tensor(d["part_cell"], dtype=torch.long)      # DE-HNN: VN over CELLS
     bufcnt = float(getattr(m, "buffer_count", np.nan))
     g = dict(
@@ -283,7 +298,7 @@ class BipartiteConv(nn.Module):
 ENCODERS = {"dehnn", "dehnn_novn", "dehnn_undirected", "sage", "gat"}
 
 class FPlace(nn.Module):
-    def __init__(self, d=64, K=4, cell_in=25, net_in=4, knob=3, dfeat=18, encoder="dehnn"):
+    def __init__(self, d=64, K=4, cell_in=25, net_in=4, knob=5, dfeat=18, encoder="dehnn"):
         super().__init__()
         assert encoder in ENCODERS, f"unknown encoder {encoder}; pick from {ENCODERS}"
         self.encoder = encoder
