@@ -338,7 +338,13 @@ def load_graph(flow_id, device="cpu"):
         # all targets: log space, then STANDARDIZED with train-fold stats -> ~N(0,1).
         # (raw log-means span 2.4..11.2; unstandardized, tot_hpwl swamps the gradient.)
         y_net_hpwl=_z("net_hpwl", torch.log(t(d["net_hpwl"]).clamp(min=1e-6))),
-        m_net_hpwl=t(np.isfinite(d["net_hpwl"]) & (d["net_hpwl"] > 0), torch.bool),
+        # mask = finite AND positive AND the label is TRUSTWORTHY. The graph is @floorplan but
+        # labels are @global_place; buffer insertion SPLITS high-fanout nets in between, and the
+        # name survives so name-matching silently attached a FRAGMENT's HPWL to the full net.
+        # 0.41% of nets — but they carry 4-6% of total HPWL, median 20x the rest, i.e. exactly
+        # the highest-leverage nets in the per-net head. cache/netmask marks them. (audit B2)
+        m_net_hpwl=t(np.isfinite(d["net_hpwl"]) & (d["net_hpwl"] > 0)
+                     & np.load(f"{ROOT}/cache/netmask/{flow_id}.npz")["label_ok"], torch.bool),
         y_tot_hpwl=_z("tot_hpwl", t(np.log(max(m.total_hpwl, 1e-6)))),
         y_buf_area=_z("buf_area", t(np.log(max(m.buffer_area, 0) + 1.0))),
         y_buf_cnt =_z("buf_cnt",  t(np.log(max(bufcnt, 0) + 1.0))) if np.isfinite(bufcnt) else t(0.0),
@@ -370,14 +376,30 @@ def load_graph(flow_id, device="cpu"):
     g["wns_true"] = float(m.wns); g["tns_true"] = float(m.tns)
     return {k: (v.to(device) if torch.is_tensor(v) else v) for k, v in g.items()}
 
-# ---------- DE-HNN HyperConvLayer (verbatim) ----------
+# ---------- DE-HNN HyperConvLayer ----------
 class HyperConv(nn.Module):
+    """DE-HNN's HyperConvLayer, with ONE deliberate change: MEAN aggregation, not SUM.
+
+    SimpleConv defaults to aggr='sum'. Unnormalized, that made the message into a net scale with
+    its fanout. Measured on ethernet:
+        2-pin net           ->  |msg|      8.3
+        8-32 fanout         ->  |msg|     65.4
+        clock (fanout 10k)  ->  |msg| 68,671.9      <- 4 ORDERS of magnitude
+    and this feeds psi's first Linear, then propagates back to cells BEFORE any LayerNorm — so
+    every flip-flop's embedding was dominated by the clock net.
+
+    DE-HNN defends against this TWO ways we didn't: gcn_norm degree weights on every edge
+    (dehnn_layers.py:66-72, train_all_cross.py:85-87) AND dropping nets with fanout >= 3000
+    (train_all_cross.py:70-78). Mean-aggregation achieves the same normalization in one step
+    and keeps every net (we can't afford to drop the clock net — it drives timing).
+    """
     def __init__(self, d):
         super().__init__()
         self.lin_node, self.lin_net = Seq(Linear(d, d)), Seq(Linear(d, d))
         self.psi = Seq(Linear(d*3, d), ReLU(), Linear(d, d))   # net update
         self.mlp = Seq(Linear(d*3, d), ReLU(), Linear(d, d))   # cell update
-        self.forward_conv, self.back_conv = SimpleConv(), SimpleConv()
+        self.forward_conv = SimpleConv(aggr="mean")            # cells -> nets  (degree-normalized)
+        self.back_conv    = SimpleConv(aggr="mean")            # nets  -> cells
 
     def forward(self, x, x_net, ntn, ttype, ntc):
         h_net = self.lin_net(x_net) + x_net
@@ -400,7 +422,8 @@ class HyperConvUndirected(nn.Module):
         self.lin_node, self.lin_net = Seq(Linear(d, d)), Seq(Linear(d, d))
         self.psi = Seq(Linear(d*2, d), ReLU(), Linear(d, d))
         self.mlp = Seq(Linear(d*2, d), ReLU(), Linear(d, d))
-        self.forward_conv, self.back_conv = SimpleConv(), SimpleConv()
+        self.forward_conv = SimpleConv(aggr="mean")     # mean, same as HyperConv (see its docstring)
+        self.back_conv    = SimpleConv(aggr="mean")
     def forward(self, x, x_net, ntn, ttype, ntc):
         h_net = self.lin_net(x_net) + x_net
         h     = self.lin_node(x)    + x
@@ -469,7 +492,12 @@ class FPlace(nn.Module):
         # critical path) and TNS is a SUM; mean-pool alone washes the critical cell out among
         # ~48k others. max-pool exposes it. The ctx skip lets clock_period + the floorplan
         # anchor reach WNS/TNS directly instead of surviving VN->graph->pool dilution.
-        self.fc1_net  = Linear(d, 256)
+        # per-net head NOW HAS A CTX SKIP. It didn't, and knobs were effectively DEAD there:
+        # measured |d(mu)/d(knobs)| = 0.0083 vs 0.19-0.37 for every ctx-skip head, and raising
+        # utilization by 50% moved the per-net HPWL prediction by 0.11% of its own output std.
+        # Utilization physically rescales the die and therefore EVERY net's HPWL. For a
+        # knob-conditioned world model whose whole point is counterfactuals, that is fatal.
+        self.fc1_net  = Linear(d + d, 256)            # [net embedding, ctx skip]
         self.fc1_cell = Linear(d + d, 256)            # per-cell readout: [cell embedding, ctx skip]
         self.fc1_glob = Linear(4*d + d, 256)          # [h.mean,h.max,hn.mean,hn.max, ctx]
         self.h_net_hpwl = Linear(256, 2)
@@ -515,7 +543,7 @@ class FPlace(nn.Module):
                 vn_t = torch.cat([scatter(h, part, 0, dim_size=nvn, reduce="mean"),
                                   scatter(h, part, 0, dim_size=nvn, reduce="max")], 1)
                 vn = self.mlp_vn[l](vn_t) + vn
-        hn = F.leaky_relu(self.fc1_net(h_net))
+        hn = F.leaky_relu(self.fc1_net(torch.cat([h_net, ctx.expand(h_net.size(0), -1)], 1)))
         hc = F.leaky_relu(self.fc1_cell(torch.cat([h, ctx.expand(h.size(0), -1)], 1)))  # per-cell
         hg = F.leaky_relu(self.fc1_glob(torch.cat([
             h.mean(0), h.max(0).values, h_net.mean(0), h_net.max(0).values, ctx])))
