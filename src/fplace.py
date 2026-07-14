@@ -109,12 +109,23 @@ def _slog(x):
 # Indices below are in the RAW cache layout; they are remapped to the post-drop layout at the
 # bottom of this block (see KEEP_CELL/KEEP_DF in _cellfeat).
 _LOG_CELL_RAW = [9, 10, 11, 12, 13, 14]          # drive, caps, leakage, area, degree
-LOG_NET       = [0]                              # fanout
 
 # Indicator dims are left as raw 0/1 — NEVER z-scored. z-scoring a rare binary divides
 # by a tiny std and detonates: is_buf (0.004% of cells) hit +41 sigma, is_reset +80 sigma.
 _IDENT_CELL_RAW = [4, 5, 6]                      # is_seq/inv/buf   (filler/diode are DEAD)
 IDENT_NET       = [1, 2, 3]                      # is_io/is_clock/is_reset
+
+# NET features = [fanout, is_io, is_clock, is_reset] ++ 14 Net2 PARTITION features.
+# Net2 (ASP-DAC'21): 725 nets with IDENTICAL local features had lengths spanning 1um..100um —
+# a net model with only local features "cannot distinguish them at all". Cells in DIFFERENT
+# clusters get placed FAR APART, so cluster disagreement is a pre-placement proxy for physical
+# distance = exactly what HPWL is, and what fanout can never express.
+# 7 METIS granularities x {span, disagreement-fraction}. Verified on our data: top-10%-longest-net
+# AUC 0.864 -> 0.937 (ethernet), mean 0.918 vs Net2's reported 0.922.
+N_PART_NET  = 14
+NET_IN      = 4 + N_PART_NET                      # 18
+_LOG_NET_RAW = [0] + list(range(4, 4 + 14, 2))    # fanout + the 7 SPAN dims (counts; frac is [0,1])
+LOG_NET      = _LOG_NET_RAW
 #   design_features 18 (insertion order in build_graph.py):
 #     0 n_cells 1 n_nets 2 n_pins 3 total_cell_area 4-8 frac_* 9 fanout_mean
 #     10 fanout_max 11 fanout_p90 12-14 frac_*pin 15 clock_fanout 16 n_clock 17 n_reset
@@ -201,6 +212,16 @@ def _dffeat(d):
     """design_features (18 -> 16 live dims)."""
     return np.nan_to_num(np.asarray(d["df_vals"])[KEEP_DF])
 
+def _netfeat(d, flow_id):
+    """net_x (4) ++ Net2 partition features (14) -> (N, 18).
+    The graph is identical across a design's 108 flows, so the partition is computed ONCE per
+    design (scripts/add_partition_features.py) and shared."""
+    dsg = flow_id.rsplit("-", 1)[0]
+    pf  = np.load(f"{ROOT}/cache/part/{dsg}.npz")["part_net"]
+    nx  = np.asarray(d["net_x"])
+    assert len(pf) == len(nx), f"{flow_id}: part {len(pf)} vs nets {len(nx)}"
+    return np.nan_to_num(np.concatenate([nx, pf], 1))
+
 def _pe_norm(pe):
     """Laplacian PE, RMS-normalized per design. Sign is handled by the model (SignNet), NOT here.
 
@@ -244,7 +265,7 @@ def set_norm(train_designs, force=False):
         for p in fl[:2]:                                    # graph feats barely move with knobs
             d = np.load(p, allow_pickle=True)
             cx.append(_pre(_cellfeat(d), LOG_CELL))
-            nx.append(_pre(d["net_x"], LOG_NET)); df.append(_pre(_dffeat(d), LOG_DF))
+            nx.append(_pre(_netfeat(d, os.path.basename(p)[:-4]), LOG_NET)); df.append(_pre(_dffeat(d), LOG_DF))
         for p in fl[::11][:10]:                             # per-net targets DO move with knobs
             d = np.load(p, allow_pickle=True)
             a = d["net_hpwl"];   ynh.append(np.log(a[np.isfinite(a) & (a > 0)]))
@@ -377,7 +398,7 @@ def load_graph(flow_id, device="cpu"):
     t  = lambda a, dt=torch.float: torch.tensor(np.asarray(a), dtype=dt)
     # log1p the heavy-tailed magnitude dims, THEN z-score (train-fold stats). Must match set_norm().
     cell_x = (_pre(_cellfeat(d, keep), LOG_CELL) - nm["cx_m"]) / nm["cx_s"]
-    net_x  = (_pre(d["net_x"],  LOG_NET) - nm["nx_m"]) / nm["nx_s"]
+    net_x  = (_pre(_netfeat(d, flow_id), LOG_NET) - nm["nx_m"]) / nm["nx_s"]
     dfeat  = (_pre(_dffeat(d), LOG_DF) - nm["df_m"]) / nm["df_s"]
     # knobs + FLOORPLAN-TIMING ANCHOR (fp_wns/fp_tns). The anchor gives the model the
     # design's baseline timing LEVEL — the part that doesn't transfer cross-design and
@@ -531,7 +552,7 @@ class BipartiteConv(nn.Module):
 ENCODERS = {"dehnn", "dehnn_novn", "dehnn_undirected", "sage", "gat"}
 
 class FPlace(nn.Module):
-    def __init__(self, d=64, K=4, cell_in=CELL_IN, net_in=4, knob=5, dfeat=DF_IN, encoder="dehnn"):
+    def __init__(self, d=64, K=4, cell_in=CELL_IN, net_in=NET_IN, knob=5, dfeat=DF_IN, encoder="dehnn"):
         super().__init__()
         assert encoder in ENCODERS, f"unknown encoder {encoder}; pick from {ENCODERS}"
         self.encoder = encoder
