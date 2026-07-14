@@ -5,25 +5,28 @@
 #SBATCH --cpus-per-task=4
 #SBATCH --mem=32G
 #SBATCH --time=24:00:00
-#SBATCH --array=0-8                 # 3 encoders x 3 CV folds, all in parallel
+#SBATCH --array=0-11                # 4 variants x 3 CV folds, all in parallel
 #SBATCH --output=logs/%x_%A_%a.out
 #SBATCH --error=logs/%x_%A_%a.err
 #SBATCH --exclude=node049
 
-# ENCODER COMPARISON — does DE-HNN's directed-hypergraph machinery actually beat a plain GNN?
-# We have ASSUMED it does and never tested it. Now we test it.
+# ENCODER ABLATION — two questions we have ASSUMED the answer to and never tested:
+#   Q1: does DE-HNN's directed-hypergraph conv actually beat a plain GNN on OUR task?
+#   Q2: do the virtual nodes earn their keep?
 #
-#   task 0,1,2 -> dehnn   (bipartite cell<->net, driver/sink split, psi/mlp)  folds 0,1,2
-#   task 3,4,5 -> sage    (GraphSAGE on the same bipartite graph)             folds 0,1,2
-#   task 6,7,8 -> gat     (GATv2   on the same bipartite graph)               folds 0,1,2
+#   task  0,1,2 -> dehnn        driver/sink split + psi/mlp   + VN     folds 0,1,2
+#   task  3,4,5 -> sage         GraphSAGE                     + VN     folds 0,1,2
+#   task  6,7,8 -> gat          GATv2                         + VN     folds 0,1,2
+#   task 9,10,11-> dehnn_novn   driver/sink split + psi/mlp   NO VN    folds 0,1,2
 #
-# Same data, same targets, same loss, same everything else. Only the message passing differs.
+# EVERYTHING else is identical — same graph, same node features (SignNet PE, type_emb), same
+# knob/ctx conditioning, same heads, same loss, same folds, same normalization. Only the
+# message-passing operator changes (and, for novn, the virtual nodes). So any difference is
+# attributable to that one thing.
 #
-# Results land in runs/cmp_<encoder>/ — pull the whole dir off the cluster:
-#   tar czf results.tar.gz runs/cmp_* logs/fpcmp_*
-#
-# After all 9 finish:
-#   for E in dehnn sage gat; do OUT=runs/cmp_$E python src/train_fplace.py --aggregate; done
+# Results -> runs/cmp_<variant>/. Bring them home with git (checkpoints are gitignored):
+#   for E in dehnn sage gat dehnn_novn; do OUT=runs/cmp_$E python src/train_fplace.py --aggregate; done
+#   git add -A runs/ logs/ && git commit -m "results: encoder ablation" && git push
 
 set -euo pipefail
 mkdir -p logs runs
@@ -34,7 +37,7 @@ module load cuda12.8/toolkit/12.8.1
 source "${HOME}/PlaceDreamer/venv/bin/activate"
 cd "${HOME}/PlaceDreamer"
 
-ENCODERS=(dehnn sage gat)
+ENCODERS=(dehnn sage gat dehnn_novn)
 IDX=${SLURM_ARRAY_TASK_ID}
 export ENCODER=${ENCODERS[$((IDX / 3))]}
 export FOLD=$((IDX % 3))
