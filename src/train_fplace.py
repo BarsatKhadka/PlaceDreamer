@@ -147,7 +147,13 @@ def evaluate(model, flows):
             P[k].append(np.array([recon(k, lv, dv, nm, g.get(f"w_{k}"))]))
             T[k].append(np.array([g[f"y_{k}"].item()]))          # raw log
             sig[k].append(np.array([o[f"{k}_dev"][1].item()]))
-            if not g.get(f"deg_{k}", False):     # R2 needs the truth to VARY; skip flat designs
+            # DEGENERATE designs: the knobs do not move this target AT ALL (usb_phy has TWO
+            # distinct buffer_area values across all 108 flows; simple_spi sits at ONE value in
+            # 91 of 108). R2 needs the truth to VARY — scoring a constant target is a division
+            # by ~zero, and that single degenerate design dragged buf_area_dev to exactly +0.000.
+            # There is no knob response to score, so skip it. (The ABSOLUTE metric for k is still
+            # valid on these designs — the level is real — so only the DEV metric is skipped.)
+            if not g.get(f"deg_{k}", False):
                 P[k+"_dev"].append(np.array([dv]))
                 T[k+"_dev"].append(np.array([g[f"y_{k}_dev"].item()]))
         # WNS/TNS READOUT from per-endpoint slack (denorm to raw slack), vs recorded truth.
@@ -183,9 +189,15 @@ def evaluate(model, flows):
         elif k in DEVK:                    # the KNOB RESPONSE, in within-design std units
             rp, rt = p, t
             rel = np.abs(rp - rt)
-        else:                              # wns/tns: already raw ns
+        elif k == "wns":                   # already raw ns — absolute error is the honest one
             rp, rt = p, t
             rel = np.abs(rp - rt)
+        else:                              # k == "tns": RELATIVE error is MEANINGLESS here.
+            # TNS spans 0 .. -35,000 ns, so |err|/|truth| on a near-zero denominator explodes
+            # (we printed 9146% and it meant nothing). Normalise by the design's own TNS scale
+            # instead, so the number is comparable across designs and finite.
+            rp, rt = p, t
+            rel = np.abs(rp - rt) / np.maximum(np.abs(rt).mean(), 1.0)
         d = dict(n=int(len(t)),
                  mae=float(np.mean(np.abs(rp - rt))),      # real units
                  med_ae=float(np.median(np.abs(rp - rt))),
@@ -208,8 +220,13 @@ def evaluate(model, flows):
     # ---- WITHIN-DESIGN error: hold design size constant, so what's left IS the knob response —
     # the only thing f_place exists to predict. Reported as R2 (not Pearson r: a design can have
     # r=0.9 with a NEGATIVE within-design R2 if the slope or bias is wrong).
+    # NOTE: within_r2 is NOT computed for the GLOB targets. It is measured on the RECONSTRUCTED
+    # level+dev, and within one design the level is a CONSTANT — so any level bias tanks it even
+    # when the knob response is perfect (we saw buf_cnt within_r2 = -1329 while its DEV head
+    # scored +0.335). The DEV heads (DEVK) already measure the knob response cleanly and are the
+    # honest number. Keep within_r2 only where there is no level/dev split (wns/tns).
     dd_all = np.array(dz)
-    for k in GLOB + DEVK + DERIV:
+    for k in DEVK + DERIV:
         if k not in res: continue
         p = np.concatenate([np.asarray(x) for x in P[k]]); t = np.concatenate([np.asarray(x) for x in T[k]])
         dd = dd_all[:len(p)]
