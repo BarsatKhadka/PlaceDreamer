@@ -78,16 +78,38 @@ OOD_DESIGNS = ["jpeg",       # 54,900 cells — largest, DSP  → size extrapola
                "i2c"]        #    908 — tiny, interface
 
 # ---------- dev-set CV (leave-designs-out) ----------
+# Design sizes (live cells, i.e. AFTER dropping tapcells). Used to stratify the folds.
+DESIGN_SIZE = {
+    "ss_pcm": 268, "sasc": 275, "usb_phy": 354, "simple_spi": 411, "systemcdes": 1479,
+    "spi": 1868, "des3_area": 2512, "ac97_ctrl": 4567, "mem_ctrl": 4729, "systemcaes": 5028,
+    "usb_funct": 9221, "pci": 9428, "ethernet": 20596,
+    # OOD (never in a dev fold):
+    "i2c": 633, "wb_dma": 1964, "tv80": 4426, "aes_core": 11383, "jpeg": 37082,
+}
+# SIZE ANCHORS — always in TRAIN, never tested. They pin the ENDS of the training size range so
+# every test design is bracketed by training designs, i.e. INTERPOLATION, never extrapolation.
+# Without this, a random shuffle put ethernet (20,596 cells) in a TEST fold while the largest
+# TRAINING design was 9,428 — a 2.2x size extrapolation. That fold's timing scored -5.03 while
+# another fold scored +0.49. That was FOLD DIFFICULTY masquerading as model variance, and it
+# made every config comparison unreliable.
+# jpeg (37,082) stays in the LOCKED OOD set — it is the real extrapolation test, run ONCE at the end.
+SIZE_ANCHORS = ["ethernet", "ss_pcm"]        # largest and smallest dev designs
+
 def make_folds():
-    """CV folds over the DEV designs only. OOD designs are excluded entirely."""
+    """Size-STRATIFIED CV folds over the DEV designs. OOD designs are excluded entirely.
+
+    The size extremes are pinned into TRAIN, and the rest are round-robined by size, so every
+    fold's test set spans small->large AND sits inside the training range. Fold difficulty is
+    equalized, so a difference between two configs is attributable to the CONFIG, not the fold.
+    """
     all_d = sorted(meta().index.str.replace(r"-\d+$", "", regex=True).unique())
     dev = [d for d in all_d if d not in OOD_DESIGNS]           # 13 dev designs
-    rng = random.Random(SEED); d = dev[:]; rng.shuffle(d)
-    sizes = [5, 4, 4]                                          # 13 dev designs, each tested once
-    folds, i = [], 0
-    for s in sizes:
-        folds.append(sorted(d[i:i+s])); i += s
-    return dev, folds
+    testable = sorted([d for d in dev if d not in SIZE_ANCHORS],
+                      key=lambda d: DESIGN_SIZE.get(d, 0))     # 11, sorted small -> large
+    folds = [[] for _ in range(3)]
+    for i, d in enumerate(testable):                           # round-robin by size
+        folds[i % 3].append(d)
+    return dev, [sorted(f) for f in folds]
 
 def flows_of(designs):
     idx = meta().index
@@ -288,11 +310,13 @@ def run_fold(fi, test_designs, all_designs):
     # construction. So val could not see cross-design overfitting at all, yet it drove BOTH the
     # LR schedule AND checkpoint selection. There was no held-out-design signal anywhere in the
     # training loop. Now: hold out 2 TRAIN designs as val; the model never sees them in training.
-    pool     = [d for d in all_designs if d not in test_designs]
+    # val = 2 held-out DESIGNS. NEVER take a SIZE ANCHOR for val — the anchors exist to pin the
+    # ends of the training size range, so removing one would re-open the extrapolation hole.
+    pool     = [d for d in all_designs if d not in test_designs and d not in SIZE_ANCHORS]
     rngd     = random.Random(SEED + 100 + fi)
     shuf     = pool[:]; rngd.shuffle(shuf)
     val_d    = sorted(shuf[:2])                       # 2 held-out DESIGNS for validation
-    train_d  = sorted(shuf[2:])
+    train_d  = sorted(shuf[2:] + SIZE_ANCHORS)        # anchors ALWAYS in train
     tr, val, te = flows_of(train_d), flows_of(val_d), flows_of(test_designs)
     rng = random.Random(SEED); rng.shuffle(tr)
     print(f"\n=== fold {fi}: test on {len(test_designs)} designs {test_designs}", flush=True)
