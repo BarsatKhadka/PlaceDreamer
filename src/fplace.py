@@ -149,30 +149,55 @@ CELL_IN    = len(KEEP_CELL) + 10          # 12 library + 10 PE = 22
 DF_IN      = len(KEEP_DF)                 # 16
 PE_SLICE   = slice(len(KEEP_CELL), CELL_IN)   # the 10 PE dims, post-drop
 
-def _cellfeat(d):
-    """cell_x (15 -> 12 live dims) ++ Laplacian PE (10) -> (C,22).
+def live_cells(d):
+    """Boolean mask of cells with at least one signal pin.
+
+    34-58% of cells are TAP_TAPCELL_ROW_* — physical-only tap cells with ZERO signal pins.
+    Verified: 100% of degree-0 cells are tapcells, they carry 0 endpoint labels, and their
+    Laplacian PE is EXACTLY zero (max |PE| ~1e-17). They are pure dead weight, and worse:
+    the FRACTION of them varies 34%->58% across designs, so mean-pooling the PE block
+    encodes "what fraction of this design is tapcells" — a design-identity leak straight
+    into the global readout. Dropped at load time (no graph re-cache needed).
+    """
+    C = len(d["cell_type"])
+    deg = np.zeros(C, np.int64)
+    for arr in (d["edge_driver"], d["edge_sink"]):
+        np.add.at(deg, np.asarray(arr)[0], 1)
+    return deg > 0
+
+def _cellfeat(d, keep=None):
+    """cell_x (15 -> 12 live dims) ++ Laplacian PE (10) -> (C,22), tapcells dropped.
     Single source of truth: set_norm() and load_graph() BOTH go through this, so the
     stats can never drift from what the model is actually fed."""
-    cx = np.asarray(d["cell_x"])[:, KEEP_CELL]
-    return np.nan_to_num(np.concatenate([cx, _pe_norm(d["pe_cell"])], 1))
+    if keep is None: keep = live_cells(d)
+    cx = np.asarray(d["cell_x"])[keep][:, KEEP_CELL]
+    return np.nan_to_num(np.concatenate([cx, _pe_norm(np.asarray(d["pe_cell"])[keep])], 1))
 
 def _dffeat(d):
     """design_features (18 -> 16 live dims)."""
     return np.nan_to_num(np.asarray(d["df_vals"])[KEEP_DF])
 
 def _pe_norm(pe):
-    """Laplacian PE: passed through RAW, exactly as DE-HNN does. Do not "normalize" it.
+    """Laplacian PE, RMS-normalized per design. Sign is handled by the model (SignNet), NOT here.
 
-    eigsh returns unit-L2 eigenvectors, so every entry is already bounded in [-1,1]
-    (observed max 0.596) — they need no scaling. Two things we tried and reverted:
-      * global z-score across designs  -> +61 sigma outliers (PE scale ~1/sqrt(n_cells),
-        so a 48k-cell design and a 575-cell one are on different scales; pooling their
-        stats is meaningless).
-      * per-design std standardization -> +138 sigma. WORSE: eigenvectors on large sparse
-        graphs localize on a few nodes, so dividing by std inflates exactly those spikes.
-    Raw is bounded, cross-design-consistent, and what the paper feeds. Leave it alone.
+    Two separate pathologies, both measured:
+      (1) SIGN AMBIGUITY. eigsh returns eigenvectors with an ARBITRARY sign (and arbitrary
+          rotation inside degenerate eigenspaces). Across reruns, 4-8 of our 10 dims flip.
+          So the "same" structural position encodes differently in different designs.
+          => the model must be sign-INVARIANT. Handled in FPlace.pe_encoder (SignNet:
+          phi(v) + phi(-v), which is identical for v and -v by construction).
+          NOTE: DE-HNN does NOT fix this anywhere in their codebase — but their targets are
+          z-scored PER DESIGN and predicted per-node, so a per-design random sign costs them
+          little. We pool into ABSOLUTE cross-design scalars, so it costs us everything.
+          We are outside what DE-HNN validated; copying them faithfully would not save us.
+      (2) SCALE. Entries scale ~1/sqrt(C), so RMS spans 0.0045 (ethernet, 48k cells) to
+          0.042 (sasc, 575) — a 10x spread. DE-HNN's designs are all ~1M cells so this never
+          bit them. RMS-normalize per design (NOT std-normalize: an earlier attempt divided by
+          std and inflated the localized spikes to +138 sigma).
     """
-    return np.nan_to_num(np.asarray(pe, np.float32))
+    pe = np.nan_to_num(np.asarray(pe, np.float32))
+    rms = np.sqrt((pe ** 2).mean(0, keepdims=True))
+    return pe / (rms + 1e-8)
 
 def set_norm(train_designs, force=False):
     """Build feature + target normalization from TRAINING designs ONLY.
@@ -257,13 +282,21 @@ def load_graph(flow_id, device="cpu"):
     m = meta().loc[flow_id]; nm = norm()
     # cached ids are row indices into the 12x-repeated parquet -> remap to the dense 441-type
     # vocabulary (see type_remap). Unknown (-1) -> UNK slot.
-    ct = d["cell_type"].astype(np.int64)
+    # DROP TAPCELLS (34-58% of cells, zero signal pins, zero PE, zero labels — see live_cells).
+    # Every cell-indexed array must be remapped into the compacted space.
+    keep = live_cells(d)
+    old2new = np.full(len(keep), -1, np.int64)
+    old2new[keep] = np.arange(int(keep.sum()))
+    ct = d["cell_type"].astype(np.int64)[keep]
     ct = np.where(ct < 0, UNK_TYPE, type_remap()[np.clip(ct, 0, None)])
-    ed = torch.tensor(d["edge_driver"], dtype=torch.long)
-    es = torch.tensor(d["edge_sink"],   dtype=torch.long)
+    ed_np = np.asarray(d["edge_driver"]).copy(); ed_np[0] = old2new[ed_np[0]]
+    es_np = np.asarray(d["edge_sink"]).copy();   es_np[0] = old2new[es_np[0]]
+    assert ed_np[0].min() >= 0 and es_np[0].min() >= 0, "an edge referenced a dropped cell"
+    ed = torch.tensor(ed_np, dtype=torch.long)
+    es = torch.tensor(es_np, dtype=torch.long)
     t  = lambda a, dt=torch.float: torch.tensor(np.asarray(a), dtype=dt)
     # log1p the heavy-tailed magnitude dims, THEN z-score (train-fold stats). Must match set_norm().
-    cell_x = (_pre(_cellfeat(d), LOG_CELL) - nm["cx_m"]) / nm["cx_s"]
+    cell_x = (_pre(_cellfeat(d, keep), LOG_CELL) - nm["cx_m"]) / nm["cx_s"]
     net_x  = (_pre(d["net_x"],  LOG_NET) - nm["nx_m"]) / nm["nx_s"]
     dfeat  = (_pre(_dffeat(d), LOG_DF) - nm["df_m"]) / nm["df_s"]
     # knobs + FLOORPLAN-TIMING ANCHOR (fp_wns/fp_tns). The anchor gives the model the
@@ -273,7 +306,11 @@ def load_graph(flow_id, device="cpu"):
     a_tns = (_slog(float(m.fp_tns)) - nm["a_fp_tns_m"]) / nm["a_fp_tns_s"]
     knb    = np.array([m.clock_period/10.0, m.utilization/30.0, m.aspect_ratio,
                        a_wns, a_tns], np.float32)
-    part_c = torch.tensor(d["part_cell"], dtype=torch.long)      # DE-HNN: VN over CELLS
+    # VN partition, compacted to the surviving cells. Re-densify the partition ids: dropping
+    # tapcells can empty a partition, and scatter(dim_size=max+1) would leave a hole.
+    pc = np.asarray(d["part_cell"])[keep]
+    _, pc = np.unique(pc, return_inverse=True)
+    part_c = torch.tensor(pc, dtype=torch.long)                  # DE-HNN: VN over CELLS
     bufcnt = float(getattr(m, "buffer_count", np.nan))
     g = dict(
         cell_x=t(cell_x), cell_type=torch.tensor(ct), net_x=t(net_x),
@@ -294,14 +331,26 @@ def load_graph(flow_id, device="cpu"):
     )
     # per-ENDPOINT slack labels (register endpoints @ place_resized), standardized.
     # y_endpt is per-CELL (0 where no label); m_endpt masks the labeled endpoint cells.
+    # TWO fixes here:
+    #  (a) remap ep_idx into the tapcell-compacted cell space.
+    #  (b) a DFF owns SEVERAL endpoint pins (/D, /SET_B). The old fancy-index write kept the
+    #      LAST one, and groupby sorts alphabetically, so /SET_B overwrote /D and the LESS
+    #      critical slack systematically won: 15.2% of labels corrupted, and in 45% of flows
+    #      the cell holding the WORST endpoint stored a non-worst slack. Take the MIN per cell.
     ep = np.load(f"{ROOT}/cache/endpt/{flow_id}.npz")
     y_ep = np.zeros(g["n_cells"], np.float32); mask = np.zeros(g["n_cells"], bool)
+    ep_idx = np.empty(0, np.int64)
     if len(ep["ep_idx"]):
-        idx = ep["ep_idx"]
-        y_ep[idx] = (ep["ep_slack"] - nm["y_endpt_m"]) / nm["y_endpt_s"]
-        mask[idx] = True
+        idx_new = old2new[ep["ep_idx"]]
+        ok = idx_new >= 0                                    # (endpoints are never tapcells)
+        idx_new, slk = idx_new[ok], ep["ep_slack"][ok]
+        raw = np.full(g["n_cells"], np.inf, np.float32)
+        np.minimum.at(raw, idx_new, slk)                     # WORST slack per cell — fix (b)
+        ep_idx = np.unique(idx_new)
+        y_ep[ep_idx] = (raw[ep_idx] - nm["y_endpt_m"]) / nm["y_endpt_s"]
+        mask[ep_idx] = True
     g["y_endpt"] = t(y_ep); g["m_endpt"] = t(mask, torch.bool)
-    g["ep_idx"] = torch.tensor(ep["ep_idx"], dtype=torch.long)   # labeled endpoint cells
+    g["ep_idx"] = torch.tensor(ep_idx, dtype=torch.long)         # labeled endpoint cells
     # raw recorded WNS/TNS — for eval readout comparison (complete, untruncated)
     g["wns_true"] = float(m.wns); g["tns_true"] = float(m.tns)
     return {k: (v.to(device) if torch.is_tensor(v) else v) for k, v in g.items()}
@@ -369,11 +418,25 @@ class FPlace(nn.Module):
         self.encoder = encoder
         self.use_vn = encoder != "dehnn_novn"     # the no-VN ablation
         self.K = K
-        self.node_encoder = Seq(Linear(cell_in, d), LeakyReLU(), Linear(d, d))
+        # SIGN-INVARIANT PE (SignNet, Lim et al. 2023). Laplacian eigenvectors have an
+        # ARBITRARY SIGN: across eigsh reruns 4-8 of our 10 dims flip, so the same structural
+        # position encodes differently in different designs — the PE was NOISE cross-design
+        # (measured: +0.06..0.16 R2 within-design, only +0.03 pooled). A plain Linear on raw
+        # v cannot be sign-invariant. phi(v) + phi(-v) is, BY CONSTRUCTION: swapping v -> -v
+        # permutes the two terms and leaves the sum identical.
+        # Applied per-eigenvector (each of the 10 dims is independently sign-ambiguous).
+        self.n_pe = PE_SLICE.stop - PE_SLICE.start                       # 10
+        self.pe_phi = Seq(Linear(1, 32), LeakyReLU(), Linear(32, 32))    # phi: per-eigvec
+        self.pe_rho = Seq(Linear(32 * self.n_pe, d), LeakyReLU(), Linear(d, d))   # rho: combine
+        self.node_encoder = Seq(Linear(cell_in - self.n_pe, d), LeakyReLU(), Linear(d, d))
         self.net_encoder  = Seq(Linear(net_in, d),  LeakyReLU(), Linear(d, d))
         self.type_emb = nn.Embedding(N_TYPES, d)
+
         # --- VN (DE-HNN exact): cells only, mean+max pooling, concat-MLP broadcast ---
-        self.virtualnode_encoder = Seq(Linear(cell_in*2, d*2), LeakyReLU(), Linear(d*2, d))
+        # VN pools the SIGN-INVARIANT features (library dims + SignNet PE embedding), NOT raw
+        # cell_x — pooling raw PE would leak the arbitrary sign straight back into the VN.
+        self.vn_in_dim = (cell_in - self.n_pe) + d
+        self.virtualnode_encoder = Seq(Linear(self.vn_in_dim*2, d*2), LeakyReLU(), Linear(d*2, d))
         self.mlp_vn  = nn.ModuleList([Seq(Linear(d*2, d), LeakyReLU(), Linear(d, d)) for _ in range(K)])
         self.back_vn = nn.ModuleList([Seq(Linear(d*2, d), LeakyReLU(), Linear(d, d)) for _ in range(K)])
         # --- OUR addition (architecture.md §2): knob+design context injected INTO the VN ---
@@ -400,15 +463,26 @@ class FPlace(nn.Module):
         # ctx skip so clock_period + the floorplan anchor reach each endpoint's slack directly.
         self.h_endpt = Linear(256, 2)
 
+    def encode_pe(self, pe):
+        """SignNet: rho( concat_i [ phi(v_i) + phi(-v_i) ] ). Invariant to v_i -> -v_i by
+        construction — swapping the sign permutes the two phi terms and the sum is unchanged."""
+        v = pe.unsqueeze(-1)                                  # (C, n_pe, 1)
+        s = self.pe_phi(v) + self.pe_phi(-v)                  # (C, n_pe, 32)  <- sign-invariant
+        return self.pe_rho(s.flatten(1))                      # (C, d)
+
     def forward(self, g):
-        h     = self.node_encoder(g["cell_x"]) + self.type_emb(g["cell_type"])
+        # split raw cell features: library dims | Laplacian PE (sign-ambiguous -> SignNet)
+        lib, pe = g["cell_x"][:, :PE_SLICE.start], g["cell_x"][:, PE_SLICE]
+        feat  = torch.cat([lib, self.encode_pe(pe)], 1)       # sign-INVARIANT cell features
+        h     = self.node_encoder(lib) + self.type_emb(g["cell_type"]) + self.encode_pe(pe)
         h_net = self.net_encoder(g["net_x"])
         part, nvn = g["part_cell"], g["num_vn"]
         ctx = self.ctx(torch.cat([g["knobs"], g["dfeat"]]))
         if self.use_vn:
-            # VN init: DE-HNN pooled input feats + OUR knob/design ctx (→ broadcast every layer)
-            vn_in = torch.cat([scatter(g["cell_x"], part, 0, dim_size=nvn, reduce="mean"),
-                               scatter(g["cell_x"], part, 0, dim_size=nvn, reduce="max")], 1)
+            # VN init: DE-HNN pooled input feats + OUR knob/design ctx (→ broadcast every layer).
+            # Pool the SIGN-INVARIANT `feat`, not raw cell_x (raw PE would leak the sign in).
+            vn_in = torch.cat([scatter(feat, part, 0, dim_size=nvn, reduce="mean"),
+                               scatter(feat, part, 0, dim_size=nvn, reduce="max")], 1)
             vn = self.virtualnode_encoder(vn_in) + ctx
         else:
             h, h_net = h + ctx, h_net + ctx        # no VN → ctx can only be added at input
