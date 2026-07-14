@@ -8,13 +8,24 @@ Train f_place — locked OOD holdout + leave-designs-out CV on the dev set.
  13 DEV designs        → 3 CV folds (hold out 5/4/4), every dev design tested once.
                          ALL development — hyperparams, ablations, loss weights — happens here.
 
-Reports per target: R², median relative error, within-design r (the knob-effect signal).
+VALIDATION IS A HELD-OUT-DESIGN SPLIT (2 designs, never trained on). It used to be a random
+10% of FLOWS from the training designs — which, since ~99% of the global targets' variance is
+design identity, meant val SHARED that identity with train and could not see cross-design
+overfitting at all. Yet it drove both the LR schedule and checkpoint selection.
+
+METRICS: plain absolute error in REAL units (um, um^2, cells, ns) is PRIMARY. Pooled R2 is
+reported but is NOT trustworthy for the global targets — ~99% of their variance is merely
+"how big is this design", so R2 flatters. `within-R2` (design size held constant) is the number
+that measures the knob response, which is the only thing f_place exists to predict.
 
 Env vars (SLURM-friendly):
   FOLD=0|1|2|all     which fold(s)          (default all)
   ENCODER=dehnn|dehnn_novn|dehnn_undirected|sage|gat   (default dehnn)
-  EPOCHS=30  LR=1e-3  DIM=64  LAYERS=4  ACCUM=8  SEED=0
-  W_NETHPWL / W_NETDEM / W_TOT / W_BUFA / W_BUFC   loss weights (default 1each)
+  EPOCHS=200  LR=1e-3  DIM=64  LAYERS=4  ACCUM=8  SEED=0
+  W_NETHPWL=5 W_ENDPT=3 W_TOT=1 W_BUFA=1 W_BUFC=1   loss weights (dense targets up-weighted:
+                     they are a .mean() over ~10k nets, so each element got 1/N of the gradient
+                     while every global scalar contributed its error undivided — net_hpwl was
+                     getting 2.2% of the encoder's gradient, a single scalar 17.8%)
   OUT=runs/<name>    where to write metrics/checkpoints
 
 Usage:  python src/train_fplace.py
@@ -23,7 +34,7 @@ import os, sys, glob, json, time, random
 import numpy as np, pandas as pd, torch
 from scipy.stats import pearsonr
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from fplace import FPlace, load_graph, loss_fn, gnll, meta, CACHE, set_norm, denorm, norm
+from fplace import FPlace, load_graph, gnll, meta, CACHE, set_norm, denorm
 
 E = os.environ.get
 DEV     = "cuda" if torch.cuda.is_available() else "cpu"
@@ -39,17 +50,17 @@ LOSS     = E("LOSS", "decoupled")   # decoupled | beta | nll | mse
 WARMUP   = int(E("WARMUP", 0))      # 0 = off. Only meaningful for LOSS=beta/nll.
 NLL_LR_MULT = float(E("NLL_LR_MULT", 1.0))
 OUT     = E("OUT", f"runs/{ENCODER}")
-W = dict(net_hpwl=float(E("W_NETHPWL",1)),
-         tot_hpwl=float(E("W_TOT",1)), buf_area=float(E("W_BUFA",1)), buf_cnt=float(E("W_BUFC",1)),
-         endpt=float(E("W_ENDPT",1)),               # per-endpoint slack
-         # v2b: supervise the READOUTS directly, not just the per-endpoint mean.
-         # v2 trained endpoints to be right ON AVERAGE (val ep R²=0.83) but WNS=min collapsed
-         # (val −2.57): min depends on ONE endpoint, so average accuracy doesn't protect it —
-         # a single too-negative prediction becomes a spurious minimum. These terms make being
-         # wrong on the worst/summed endpoints cost loss directly.
-         wns_ro=float(E("W_WNS_RO", 1)),            # soft-min(pred endpoints)  vs recorded WNS
-         tns_ro=float(E("W_TNS_RO", 1)))            # sum(neg pred endpoints)   vs recorded TNS
-TAU = float(E("TAU", 0.1))   # soft-min temperature (smaller = closer to hard min)
+# LOSS WEIGHTS. The dense (per-node) targets are a .mean() over ~10k nets / ~700 endpoints, so
+# each element contributes 1/N of the gradient, while every GLOBAL scalar contributes its error
+# undivided. Measured share of the encoder's gradient at all-weights-1.0:
+#     net_hpwl  2.2%  (~10,000 supervision points/flow!)   tot_hpwl 17.8%  (1 scalar)
+#     buf_area 16.5%  buf_cnt 14.9%  endpt 25.4%           <- nobody designed this
+# Up-weight the dense targets so the encoder is actually driven by the per-node structure we
+# want it to learn, not by four scalars that are ~99% design size.
+W = dict(net_hpwl=float(E("W_NETHPWL", 5)),        # dense: ~10k nets/flow
+         endpt=float(E("W_ENDPT", 3)),             # dense: ~700 endpoints/flow
+         tot_hpwl=float(E("W_TOT", 1)), buf_area=float(E("W_BUFA", 1)),
+         buf_cnt=float(E("W_BUFC", 1)))
 torch.manual_seed(SEED); random.seed(SEED); np.random.seed(SEED)
 os.makedirs(OUT, exist_ok=True)
 
@@ -80,40 +91,21 @@ def flows_of(designs):
     idx = meta().index
     return [f for f in idx if f.rsplit("-", 1)[0] in set(designs)]
 
-def _slog_t(x):
-    """signed log1p (torch) — compresses the TNS tail (to -35k) so its loss is commensurate."""
-    return torch.sign(x) * torch.log1p(torch.abs(x))
-
-def readout_loss(out, g):
-    """v2b: supervise WNS/TNS READOUTS from the per-endpoint predictions.
-
-    WNS = min over endpoints. `min` gives gradient to only ONE endpoint, so we train with a
-    SOFT-min (temperature-weighted average, TAU) — gradient reaches every near-worst endpoint,
-    which is exactly the fragility that sank v2 (one bad prediction = spurious minimum).
-    Eval still reports the TRUE hard min, so the number stays honest.
-
-    TNS = sum of negative slacks. The per-endpoint LABELS are truncated (timing_paths is
-    top-N: ethernet has only 32% of its violations), but the RECORDED TNS is complete — so
-    this term supervises the endpoints we have no individual label for. That's its whole job.
-    """
-    ep = g["ep_idx"]
-    if len(ep) < 2: return torch.zeros((), device=out["endpt"].device)
-    n = norm()
-    slk = out["endpt"][ep, 0] * float(n["y_endpt_s"]) + float(n["y_endpt_m"])   # -> raw slack
-    # soft-min: sum_i w_i * s_i,  w = softmax(-s/TAU)  (differentiable min)
-    wns_p = (torch.softmax(-slk / TAU, dim=0) * slk).sum()
-    tns_p = torch.clamp(slk, max=0.0).sum()                                     # sum of negatives
-    Lw = (wns_p - float(g["wns_true"])).pow(2)                                  # WNS ~[-6,1]: raw
-    Lt = (_slog_t(tns_p) - _slog_t(torch.tensor(float(g["tns_true"]),
-                                                device=slk.device))).pow(2)     # TNS: signed-log
-    return W["wns_ro"] * Lw + W["tns_ro"] * Lt
+# readout_loss (v2b) DELETED — it was the direct cause of the WNS damage.
+# It summed predicted slack over ep_idx = the LABELED endpoints only (median coverage 46%),
+# but regressed that sum onto g["tns_true"] = the COMPLETE recorded TNS. Its docstring claimed
+# it "supervises the endpoints we have no individual label for" — it CANNOT: those endpoints
+# have no node in the sum and receive zero gradient. What it actually did was force the labeled
+# 46% to inflate their slack ~2.2x (des3_area: 33x), fighting the endpt MSE on the same outputs.
+# Simulating exactly that inflation reproduces the failure: wns R2 = -57.5 / -164.4 / -18.1.
+# Verified oracle ceiling: a PERFECT endpoint predictor scores tns R2 = 0.34 (label truncation),
+# but wns R2 = 0.86-1.0 — so WNS is reachable and this term was what broke it.
 
 def wloss(out, g, nll=True):
     L = (W["net_hpwl"] * gnll(out["net_hpwl"], g["y_net_hpwl"], g["m_net_hpwl"], nll)
        + W["tot_hpwl"] * gnll(out["tot_hpwl"], g["y_tot_hpwl"], None, nll)
        + W["buf_area"] * gnll(out["buf_area"], g["y_buf_area"], None, nll)
-       + W["endpt"]    * gnll(out["endpt"],    g["y_endpt"],    g["m_endpt"], nll)
-       + readout_loss(out, g))
+       + W["endpt"]    * gnll(out["endpt"],    g["y_endpt"],    g["m_endpt"], nll))
     if g["has_bufcnt"]: L = L + W["buf_cnt"] * gnll(out["buf_cnt"], g["y_buf_cnt"], None, nll)
     return L
 
@@ -152,34 +144,80 @@ def evaluate(model, flows):
         p, t = np.concatenate([np.asarray(x) for x in P[k]]), np.concatenate([np.asarray(x) for x in T[k]])
         ok = np.isfinite(p) & np.isfinite(t); p, t = p[ok], t[ok]
         if len(t) < 3 or t.std() < 1e-9: continue
-        r2 = 1 - ((t-p)**2).sum()/((t-t.mean())**2).sum()
-        if k in LOGK:   rel = float(np.median(np.abs(np.expm1(denorm(k, p) - denorm(k, t)))))
-        else:           rel = float(np.median(np.abs(p - t)))           # endpt/wns/tns: raw units
-        d = dict(r2=float(r2), rel_err=rel, n=int(len(t)))
-        if k in sig:    # calibration only where the head emits a sigma (not the derived wns/tns)
+
+        # ---- PRIMARY METRIC: plain absolute error in REAL units. No ratios, no baselines.
+        # A pooled R2 is a ratio against variance, and ~99% of the variance in the global
+        # targets is merely "how big is this design" — so R2 flattered us badly. |target-pred|
+        # cannot lie that way.
+        if k in LOGK:                      # standardized log -> real units (nm, um^2, count)
+            rp, rt = np.exp(denorm(k, p)), np.exp(denorm(k, t))
+            rel = np.abs(rp - rt) / np.maximum(np.abs(rt), 1e-9)         # relative, scale-free
+        elif k == "endpt":                 # standardized slack -> ns
+            rp, rt = denorm("endpt", p), denorm("endpt", t)
+            rel = np.abs(rp - rt)                                        # ns (absolute)
+        else:                              # wns/tns: already raw ns
+            rp, rt = p, t
+            rel = np.abs(rp - rt)
+        d = dict(n=int(len(t)),
+                 mae=float(np.mean(np.abs(rp - rt))),      # real units
+                 med_ae=float(np.median(np.abs(rp - rt))),
+                 p90_ae=float(np.percentile(np.abs(rp - rt), 90)),
+                 med_rel=float(np.median(rel)),
+                 r2=float(1 - ((t-p)**2).sum()/((t-t.mean())**2).sum()))  # kept, but SECONDARY
+
+        # ---- CALIBRATION, fixed. The old form was mean(sigma)/rmse — an ARITHMETIC mean of
+        # sigma over an RMS of residuals. By Jensen that is < 1 even for a PERFECT model
+        # (log-sigma spread 1.0 -> a perfect model scores 0.61). Every "overconfident" claim
+        # made from it was an artifact. Correct: z = r/sigma, and E[z^2] should be 1.0.
+        if k in sig:
             s = np.concatenate(sig[k])[ok]
-            ps = float(np.mean(np.exp(0.5*np.clip(s,-5,5)))); rmse = float(np.sqrt(np.mean((t-p)**2)))
-            d.update(pred_sigma=ps, rmse=rmse, calib=ps/rmse if rmse>1e-9 else float("nan"))
+            sd = np.exp(0.5 * np.clip(s, -5, 5))
+            d["calib_z2"] = float(np.mean(((t - p) / np.maximum(sd, 1e-9)) ** 2))  # want 1.0
+            d["rms_sigma"] = float(np.sqrt(np.mean(sd ** 2)))
+            d["rmse"] = float(np.sqrt(np.mean((t - p) ** 2)))
         res[k] = d
-    # within-design r (knob-effect signal, size held constant) on per-flow targets
-    for k in GLOB+DERIV:
+
+    # ---- WITHIN-DESIGN error: hold design size constant, so what's left IS the knob response —
+    # the only thing f_place exists to predict. Reported as R2 (not Pearson r: a design can have
+    # r=0.9 with a NEGATIVE within-design R2 if the slope or bias is wrong).
+    dd_all = np.array(dz)
+    for k in GLOB + DERIV:
         if k not in res: continue
-        p, t = np.concatenate([np.asarray(x) for x in P[k]]), np.concatenate([np.asarray(x) for x in T[k]])
-        dd = np.array(dz)[:len(p)]
-        rs = [pearsonr(p[dd==d], t[dd==d])[0] for d in np.unique(dd)
-              if (dd==d).sum() > 2 and t[dd==d].std() > 1e-9 and p[dd==d].std() > 1e-9]
-        if rs: res[k]["within_r"] = float(np.nanmean(rs))
+        p = np.concatenate([np.asarray(x) for x in P[k]]); t = np.concatenate([np.asarray(x) for x in T[k]])
+        dd = dd_all[:len(p)]
+        r2s, rels = [], []
+        for dsg in np.unique(dd):
+            sel = (dd == dsg) & np.isfinite(p) & np.isfinite(t)
+            if sel.sum() < 3 or t[sel].std() < 1e-9: continue
+            pp, tt = p[sel], t[sel]
+            r2s.append(1 - ((tt-pp)**2).sum()/((tt-tt.mean())**2).sum())
+            rels.append(np.median(np.abs(pp - tt)))
+        if r2s:
+            res[k]["within_r2"] = float(np.mean(r2s))       # THE number: knob-response skill
+            res[k]["within_med_ae"] = float(np.mean(rels))
+            res[k]["n_designs"] = len(r2s)
     return res
 
 def run_fold(fi, test_designs, all_designs):
-    train_d = [d for d in all_designs if d not in test_designs]
-    tr_all  = flows_of(train_d); te = flows_of(test_designs)
-    rng = random.Random(SEED); rng.shuffle(tr_all)
-    nval = max(1, int(0.1*len(tr_all))); val, tr = tr_all[:nval], tr_all[nval:]
+    # VALIDATION IS A HELD-OUT-DESIGN SPLIT.
+    # It used to be a random 10% of FLOWS from the training designs. But ~99% of the variance
+    # in the global targets is design identity — which val then SHARED with train by
+    # construction. So val could not see cross-design overfitting at all, yet it drove BOTH the
+    # LR schedule AND checkpoint selection. There was no held-out-design signal anywhere in the
+    # training loop. Now: hold out 2 TRAIN designs as val; the model never sees them in training.
+    pool     = [d for d in all_designs if d not in test_designs]
+    rngd     = random.Random(SEED + 100 + fi)
+    shuf     = pool[:]; rngd.shuffle(shuf)
+    val_d    = sorted(shuf[:2])                       # 2 held-out DESIGNS for validation
+    train_d  = sorted(shuf[2:])
+    tr, val, te = flows_of(train_d), flows_of(val_d), flows_of(test_designs)
+    rng = random.Random(SEED); rng.shuffle(tr)
     print(f"\n=== fold {fi}: test on {len(test_designs)} designs {test_designs}", flush=True)
-    print(f"    train {len(tr)} flows / {len(train_d)} designs | val {len(val)} | test {len(te)}", flush=True)
+    print(f"    train {len(tr)} flows / {len(train_d)} designs {train_d}", flush=True)
+    print(f"    val   {len(val)} flows / {len(val_d)} HELD-OUT designs {val_d}", flush=True)
+    print(f"    test  {len(te)} flows (never seen)", flush=True)
 
-    # normalization from TRAIN designs only — no test/OOD statistics ever touch the model
+    # normalization from TRAIN designs only — no val/test/OOD statistics ever touch the model
     set_norm(train_d)
 
     model = FPlace(d=DIM, K=LAYERS, encoder=ENCODER).to(DEV)
@@ -207,26 +245,27 @@ def run_fold(fi, test_designs, all_designs):
             if (i+1) % ACCUM == 0:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                 opt.step(); opt.zero_grad()
+        # leftover partial accumulation batch — clip it too (this step used to skip clipping)
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         opt.step(); opt.zero_grad()
-        # val loss (scored as trained) + per-target R² via evaluate() — endpt/wns/tns included.
-        model.eval(); vl=0.0
-        with torch.no_grad():
-            for f in val:
-                g = load_graph(f, DEV); vl += wloss(model(g), g, nll).item()
-        vl /= max(1,len(val))
-        r2 = {k: v["r2"] for k, v in evaluate(model, val).items()}
-        g_ = lambda k: r2.get(k, float("nan"))
-        # SELECTION SCORE = mean val R² over the targets we actually care about, each clipped
-        # at 0 so one blown-up target can't dominate (a -12 would swamp five good ones).
-        SEL = ("net_hpwl", "tot_hpwl", "buf_area", "buf_cnt", "wns", "tns")
-        vals = [max(0.0, r2[k]) for k in SEL if k in r2 and np.isfinite(r2[k])]
-        score = float(np.mean(vals)) if vals else -1e9
-        sched.step(score)                       # LR now follows R², not the noisy loss
+        # VAL = held-out DESIGNS -> this IS a generalization signal now.
+        model.eval()
+        v = evaluate(model, val)
+        # SELECTION SCORE: median RELATIVE error on the targets we care about (lower is better).
+        # Plain error, not R2 — R2 is a ratio against variance and ~99% of the global targets'
+        # variance is design size, so it flattered us. Negated so "higher is better" for sched.
+        SEL = ("net_hpwl", "tot_hpwl", "buf_cnt", "wns")
+        errs = [v[k]["med_rel"] for k in SEL if k in v and np.isfinite(v[k]["med_rel"])]
+        score = -float(np.mean(errs)) if errs else -1e9
+        sched.step(score)
         lr_now = opt.param_groups[0]["lr"]
-        print(f"  ep {ep:3d} [{'nll' if nll else 'mse'}] tr {tot/len(tr):7.3f} vl {vl:7.3f} "
-              f"score {score:.4f} | R² hpwl {g_('net_hpwl'):+.3f} ep {g_('endpt'):+.3f} "
-              f"tot {g_('tot_hpwl'):+.3f} bufC {g_('buf_cnt'):+.3f} wns {g_('wns'):+.3f} "
-              f"tns {g_('tns'):+.3f} | lr {lr_now:.1e} ({time.time()-t0:.0f}s)", flush=True)
+        e_ = lambda k: v[k]["med_rel"] if k in v else float("nan")
+        w_ = lambda k: v[k].get("within_r2", float("nan")) if k in v else float("nan")
+        print(f"  ep {ep:3d} tr {tot/len(tr):7.3f} | VAL(held-out designs) med-rel-err: "
+              f"hpwl {e_('net_hpwl')*100:5.1f}% tot {e_('tot_hpwl')*100:5.1f}% "
+              f"bufC {e_('buf_cnt')*100:5.1f}% | wns {e_('wns'):.3f}ns ep {e_('endpt'):.3f}ns "
+              f"| within-R² tot {w_('tot_hpwl'):+.2f} wns {w_('wns'):+.2f} "
+              f"| lr {lr_now:.1e} ({time.time()-t0:.0f}s)", flush=True)
         if score > best + 1e-4:
             best, best_state, patience = score, {k:v.detach().cpu().clone() for k,v in model.state_dict().items()}, 0
             best_ep = ep
@@ -234,17 +273,33 @@ def run_fold(fi, test_designs, all_designs):
             patience += 1
             if PATIENCE and patience >= PATIENCE:      # disabled by default (PATIENCE=0)
                 print(f"  early stop (no val improvement in {PATIENCE} epochs)"); break
-    print(f"  done — best val R²-score {best:.4f} @ epoch {best_ep}; restoring that checkpoint",
-          flush=True)
+    print(f"  done — best val score {-best:.4f} (mean med-rel-err) @ epoch {best_ep}; "
+          f"restoring that checkpoint", flush=True)
     if best_state: model.load_state_dict(best_state)
     torch.save(model.state_dict(), f"{OUT}/fold{fi}.pt")
     res = evaluate(model, te)
-    print(f"  TEST (unseen designs):", flush=True)
+    print_metrics(res, f"TEST (unseen designs: {test_designs})")
+    return dict(fold=fi, test_designs=test_designs, val_designs=val_d,
+                n_train=len(tr), n_test=len(te), metrics=res)
+
+UNITS = dict(net_hpwl="um", tot_hpwl="um", buf_area="um2", buf_cnt="cells",
+             endpt="ns", wns="ns", tns="ns")
+
+def print_metrics(res, title):
+    """Plain error in real units first; R2 last and explicitly labelled as the weak metric."""
+    print(f"\n  {title}", flush=True)
+    print(f"  {'target':9} {'med|err|':>10} {'p90|err|':>10} {'med rel':>8} "
+          f"{'within-R²':>10} {'calib z²':>9} {'pooled R²':>10}", flush=True)
     for k, v in res.items():
-        wr = f" within-r={v['within_r']:+.2f}" if 'within_r' in v else ""
-        print(f"      {k:9} R²={v['r2']:+.3f}  rel={v['rel_err']*100:5.1f}%  "
-              f"calib(σ/rmse)={v['calib']:.2f}{wr}", flush=True)
-    return dict(fold=fi, test_designs=test_designs, n_train=len(tr), n_test=len(te), metrics=res)
+        u = UNITS.get(k, "")
+        wr = f"{v['within_r2']:+.3f}" if "within_r2" in v else "     -"
+        cz = f"{v['calib_z2']:.2f}" if "calib_z2" in v else "    -"
+        print(f"  {k:9} {v['med_ae']:9.3f}{u:>1} {v['p90_ae']:9.3f}{u:>1} "
+              f"{v['med_rel']*100:7.1f}% {wr:>10} {cz:>9} {v['r2']:+10.3f}", flush=True)
+    print("   (within-R² = knob-response with design size held constant — THE number."
+          "  calib z² -> 1.0 = honest sigma.\n"
+          "    pooled R² is ~99% design-identity for the global targets — do not trust it.)",
+          flush=True)
 
 def eval_ood():
     """FINAL test — run ONCE, at the very end, on the locked OOD designs.
@@ -263,14 +318,29 @@ def eval_ood():
         model = FPlace(d=DIM, K=LAYERS, encoder=ENCODER).to(DEV)
         model.load_state_dict(torch.load(ck, map_location=DEV)); model.eval()
         r = evaluate(model, te); allres.append(r)
-        print(f"  {os.path.basename(ck)}: " + " | ".join(
-            f"{k}: R²={v['r2']:.3f} rel={v['rel_err']*100:.1f}%" for k, v in r.items()))
-    print("\n=== OOD (ensemble across folds) ===")
-    for k in ("net_hpwl","endpt","tot_hpwl","buf_area","buf_cnt","wns","tns"):
-        r2 = [r[k]["r2"] for r in allres if k in r]
-        if r2: print(f"  {k:10} R² = {np.mean(r2):.3f} ± {np.std(r2):.3f}")
+        print_metrics(r, f"OOD — {os.path.basename(ck)}")
+    print("\n=== OOD (mean across folds) ===")
+    _agg_print(allres)
     json.dump(allres, open(f"{OUT}/ood_results.json","w"), indent=2)
     print(f"\nwrote {OUT}/ood_results.json")
+
+TARGET_ORDER = ("net_hpwl","endpt","tot_hpwl","buf_area","buf_cnt","wns","tns")
+
+def _agg_print(metric_dicts):
+    print(f"  {'target':9} {'med|err|':>12} {'med rel':>12} {'within-R²':>14} {'pooled R²':>14}")
+    for k in TARGET_ORDER:
+        ms = [m[k] for m in metric_dicts if k in m]
+        if not ms: continue
+        f = lambda key: np.array([m[key] for m in ms if key in m and np.isfinite(m[key])])
+        ae, rl, wr, r2 = f("med_ae"), f("med_rel"), f("within_r2"), f("r2")
+        u = UNITS.get(k, "")
+        s_ae = f"{ae.mean():8.3f}{u:<4}" if len(ae) else " " * 12
+        s_rl = f"{rl.mean()*100:9.1f}%  " if len(rl) else " " * 12
+        s_wr = f"{wr.mean():+8.3f}±{wr.std():.2f}" if len(wr) else " " * 14
+        s_r2 = f"{r2.mean():+8.3f}±{r2.std():.2f}" if len(r2) else " " * 14
+        print(f"  {k:9} {s_ae} {s_rl} {s_wr} {s_r2}")
+    print("   (within-R² = knob response, size held constant — THE number. "
+          "pooled R² is ~99% design-identity.)")
 
 def aggregate():
     """Combine per-fold results (written by parallel array tasks) into one CV number."""
@@ -280,14 +350,7 @@ def aggregate():
     if not out:
         print(f"no {OUT}/results_fold*.json yet — folds still running?"); return
     print(f"\n=== AGGREGATE across {len(out)} folds (unseen designs) — {OUT} ===")
-    for k in ("net_hpwl","endpt","tot_hpwl","buf_area","buf_cnt","wns","tns"):
-        r2 = [f["metrics"][k]["r2"] for f in out if k in f["metrics"]]
-        wr = [f["metrics"][k]["within_r"] for f in out
-              if k in f["metrics"] and "within_r" in f["metrics"][k]]
-        if r2:
-            line = f"  {k:10} R² = {np.mean(r2):6.3f} ± {np.std(r2):.3f}"
-            if wr: line += f"   within-design r = {np.nanmean(wr):.3f}"
-            print(line)
+    _agg_print([f["metrics"] for f in out])
     json.dump(out, open(f"{OUT}/results.json","w"), indent=2)
     print(f"\nwrote {OUT}/results.json")
 

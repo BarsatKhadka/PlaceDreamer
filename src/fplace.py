@@ -1,21 +1,31 @@
 #!/usr/bin/env python3
 """
-f_place — knob-conditioned DE-HNN.
+f_place — knob-conditioned DE-HNN (netlist + knobs -> placement state).
 
-STRICT FIDELITY: the encoder is DE-HNN's `model_att.py` / `HyperConvLayer`, reproduced exactly
-(see paperCodes/DEHNN/de_hnn/models/). Our ONLY additions, all specified in docs/architecture.md:
-  (a) knob+design context INJECTED INTO THE VIRTUAL NODE (architecture.md §2 knob-injection),
-      so it is broadcast to nodes every layer rather than fading from a one-shot input add;
-  (b) multi-task uncertainty heads (mean+logvar → Gaussian NLL): per-net hpwl, per-net demand,
-      total hpwl, buffer area, buffer count.
-
-DE-HNN details reproduced verbatim:
+REPRODUCED FROM DE-HNN (`paperCodes/DEHNN/de_hnn/models/`), verified line-by-line:
   - HyperConvLayer: lin_node/lin_net + residual; driver(source)/sink split via SimpleConv;
     psi() for the net update, mlp() for the cell update; residual to the layer INPUT.
-  - VN acts on CELLS only; init = virtualnode_encoder(concat[mean_pool, max_pool] of input feats);
+  - VN over CELLS only; init = virtualnode_encoder(concat[mean_pool, max_pool] of input feats);
     per layer: broadcast = back_mlp(concat[h, vn[part]]) + h  (BEFORE conv);
-    then conv → norm → LeakyReLU; then (except last layer) vn = mlp(concat[mean,max] of h) + vn.
-  - edge dropout p=0.2 (train only); heads fc1(d→256) → LeakyReLU → fc2.
+    then conv -> norm -> LeakyReLU; then (except the last layer) vn = mlp(concat[mean,max]) + vn.
+  - edge dropout p=0.2 (train only, unlike DE-HNN which drops at eval too — theirs is the bug).
+
+OUR DELIBERATE DEVIATIONS (all measured; see docs/fplace_audit.md):
+  (a) knob+design context injected INTO THE VIRTUAL NODE, so it is broadcast every layer.
+  (b) multi-task heads emitting (mu, logvar): per-net hpwl, per-cell endpoint slack, total hpwl,
+      buffer area, buffer count. WNS/TNS are READ OUT from the endpoint head (min / sum-neg).
+  (c) `type_emb` — a cell-type embedding (441 types) added to the node encoder. DE-HNN has none.
+  (d) SIGN-INVARIANT PE (SignNet): eigenvectors have an arbitrary sign, so raw PE was NOISE
+      across designs. DE-HNN does not fix this — they can afford not to (their targets are
+      z-scored PER DESIGN and predicted per-node). We pool into ABSOLUTE cross-design scalars,
+      so we cannot. This is a place where fidelity to DE-HNN would be WRONG for our task.
+  (e) tapcells (34-58% of cells, zero signal pins, zero PE) are DROPPED. DE-HNN's designs have
+      none; keeping them leaked design identity into the pooled readout.
+  (f) global readout is mean+MAX pool + a direct ctx skip (WNS is a worst-case, not a mean).
+
+NOT reproduced (and it matters): DE-HNN passes gcn_norm edge weights and drops nets with
+fanout >= 3000. We do neither -> the clock net (fanout 10k) sends a message of norm ~68,672 vs
+8.3 for a 2-pin net. See docs/fplace_audit.md A2. STILL OPEN.
 """
 import os, glob, numpy as np, pandas as pd, torch, torch.nn as nn, torch.nn.functional as F
 from torch.nn import Sequential as Seq, Linear, ReLU, LeakyReLU
@@ -52,23 +62,28 @@ def meta():
     if _META is None: _META = pd.read_parquet(f"{ROOT}/cache/meta.parquet").set_index("flow_id")
     return _META
 
-# f_place placement-state targets. All standardized to ~N(0,1) before training so the
-# heads are commensurate (raw scales span log-means 2.4..11.2 and slacks 0.7..-35446).
-#   LOG targets:    strictly positive magnitudes -> log() then z-score.
-#   SIGNED targets: slack is <=0 and heavy-tailed -> signed-log compress, then z-score.
-# net_dem (per-net RUDY-from-bbox) was DROPPED: it's -0.94 correlated with net_hpwl (same
-# bounding box, two views) — a circular target that proves nothing. Real congestion is a
-# per-TILE field / router quantity, not per-net, and lives on the data_gen path, not here.
-LOG_TARGETS    = ("net_hpwl", "tot_hpwl", "buf_area", "buf_cnt")
-TARGETS        = LOG_TARGETS
-# Timing (WNS/TNS) is NO LONGER a direct global head. Slack lives on ENDPOINTS (register
-# D-pins), so we predict PER-ENDPOINT slack on the cell nodes and READ OUT WNS = min,
-# TNS = sum-of-negatives from those predictions (train_fplace). Per-endpoint slack is
-# intensive (a register's slack is a bounded number regardless of chip size) → transfers
-# across sizes, unlike the extensive global TNS that blew up on extrapolation.
-# v1: register endpoints only (100% node-mapped, covers all high-TNS designs). Primary-
-# output endpoints are dropped here (see scripts/add_endpoint_slack.py) — add via the
-# output-net node in v2 if PO-heavy designs (wb_dma) read out badly.
+# f_place TARGETS (the placement state). Log-space then z-scored to ~N(0,1) so the heads are
+# commensurate (raw log-means span 2.4 .. 11.2; unstandardized, tot_hpwl swamps the gradient).
+#   per-net  : net_hpwl            (dense, ~10k/flow)
+#   per-cell : endpt  (slack)      (dense, ~700/flow — WNS = min, TNS = sum-neg are READOUTS)
+#   global   : tot_hpwl, buf_area, buf_cnt
+# DROPPED: net_dem (per-net RUDY-from-bbox) — it was -0.94 correlated with net_hpwl (the same
+# bounding box, twice). Real congestion is a per-TILE router quantity, not per-net, and lives
+# on the data_gen path (EDA-Schema's routability_metrics table is EMPTY).
+#
+# KNOWN LABEL LIMITS (docs/fplace_audit.md B):
+#   - net_hpwl labels are @global_place but the graph is @floorplan. Buffer insertion SPLITS
+#     high-fanout nets in between; the name survives so nothing is masked, but the label then
+#     describes a FRAGMENT. 0.41% of nets, carrying 4-6% of HPWL, median 20x the rest. OPEN.
+#   - ~7% of total HPWL is on nets that have no floorplan node at all. So net_hpwl and tot_hpwl
+#     cannot be made consistent; any sum-readout is biased low 0-20%, design-dependent. OPEN.
+#   - endpoint labels come from timing_paths, a TOP-N truncated report: TNS coverage 9-100%
+#     (ethernet 32%). WNS reconstructs EXACTLY (the worst path is always reported). So the
+#     TNS readout undercounts by construction — a PERFECT endpoint predictor scores tns R2=0.34.
+#   - primary-output endpoints are not cell nodes and are dropped (0% on the high-TNS designs;
+#     50% on wb_dma, where the min-readout is consequently wrong). OPEN.
+LOG_TARGETS = ("net_hpwl", "tot_hpwl", "buf_area", "buf_cnt")
+TARGETS     = LOG_TARGETS
 
 def _slog(x):
     """signed log1p: sign(x)*log1p(|x|). Handles both signs and crushes the fp_wns tail
@@ -559,13 +574,9 @@ def gnll(pred, y, mask=None, nll=True, mode=None):
         l = l * lv.mul(BETA).exp().detach()        # stopgrad(sigma^(2*beta))
     return l.mean()
 
-def loss_fn(out, g):
-    L = (gnll(out["net_hpwl"], g["y_net_hpwl"], g["m_net_hpwl"])
-       + gnll(out["tot_hpwl"], g["y_tot_hpwl"])
-       + gnll(out["buf_area"], g["y_buf_area"])
-       + gnll(out["endpt"], g["y_endpt"], g["m_endpt"]))
-    if g["has_bufcnt"]: L = L + gnll(out["buf_cnt"], g["y_buf_cnt"])
-    return L
+# NOTE: the training objective lives in train_fplace.wloss (it carries the loss WEIGHTS).
+# A duplicate loss_fn() used to live here, unweighted and out of sync with what training
+# actually optimized — a trap for anyone reusing it. Removed.
 
 if __name__ == "__main__":
     import time
@@ -577,8 +588,10 @@ if __name__ == "__main__":
     opt = torch.optim.Adam(model.parameters(), lr=1e-3); t0 = time.time()
     for step in range(15):
         opt.zero_grad(); tot = 0.0
-        for g in graphs:
-            l = loss_fn(model(g), g); l.backward(); tot += l.item()
+        for g in graphs:   # the real objective (with weights) is train_fplace.wloss
+            l = (gnll(model(g)["net_hpwl"], g["y_net_hpwl"], g["m_net_hpwl"])
+                 + gnll(model(g)["endpt"], g["y_endpt"], g["m_endpt"]))
+            l.backward(); tot += l.item()
         opt.step()
         if step % 3 == 0 or step == 14:
             print(f"  step {step:3d}  loss/graph = {tot/len(graphs):.4f}  ({time.time()-t0:.0f}s)")
