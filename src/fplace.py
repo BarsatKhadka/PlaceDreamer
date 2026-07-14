@@ -26,8 +26,26 @@ from torch_geometric.utils import scatter, dropout_edge
 # override with PD_ROOT=/path/to/repo if the cache lives elsewhere (e.g. scratch).
 ROOT  = os.environ.get("PD_ROOT", os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 CACHE = f"{ROOT}/cache/graphs"
-N_TYPES = 5293
-_META = _NORM = None
+_META = _NORM = _T2N = None
+
+# ---------- cell-type vocabulary ----------
+# The sky130 standard_cells parquet has 5292 rows = the SAME 441 cells repeated 12x.
+# scripts/build_graph.py's load_cell_lib() enumerated the ROWS, so cached cell_type ids are
+# last-occurrence row indices (range 4858..5290) and the embedding was sized 5293 — of which
+# 92% (310,528 params) never received a gradient and only 174 rows are ever used.
+# Fix: a canonical 441-name vocabulary + a remap of the cached ids. Done at LOAD time so no
+# graph re-cache (and no 970MB re-upload) is needed.
+N_TYPES = 442            # 441 real cell types + 1 UNK slot (index 441)
+UNK_TYPE = 441
+
+def type_remap():
+    """old cached cell_type id (row index, 0..5291) -> dense id (0..440).
+    Precomputed into cache/type_remap.npz by scripts/make_type_remap.py so this works on the
+    cluster, which has cache/ but NOT the 71GB datasets/ dir."""
+    global _T2N
+    if _T2N is None:
+        _T2N = np.load(f"{ROOT}/cache/type_remap.npz")["old2new"]
+    return _T2N
 
 def meta():
     global _META
@@ -64,19 +82,20 @@ def _slog(x):
 # Bounded/indicator dims (flags, fractions, drive strength, w/h, PE) are left alone.
 #   cell_x 15: 0 w, 1 h, 2 n_in, 3 n_out, 4 seq, 5 inv, 6 buf, 7 fill, 8 diode,
 #              9 drive, 10 in_cap, 11 out_cap, 12 leak, 13 area, 14 degree   (+10 PE = 25)
-LOG_CELL = [9, 10, 11, 12, 13, 14]              # drive, caps, leakage, area, degree
-LOG_NET  = [0]                                  # fanout
+# Indices below are in the RAW cache layout; they are remapped to the post-drop layout at the
+# bottom of this block (see KEEP_CELL/KEEP_DF in _cellfeat).
+_LOG_CELL_RAW = [9, 10, 11, 12, 13, 14]          # drive, caps, leakage, area, degree
+LOG_NET       = [0]                              # fanout
 
 # Indicator dims are left as raw 0/1 — NEVER z-scored. z-scoring a rare binary divides
 # by a tiny std and detonates: is_buf (0.004% of cells) hit +41 sigma, is_reset +80 sigma.
-IDENT_CELL = [4, 5, 6, 7, 8]                    # is_seq/inv/buf/filler/diode
-IDENT_NET  = [1, 2, 3]                          # is_io/is_clock/is_reset
-IDENT_DF   = [4, 5, 6, 7, 8, 12, 13, 14]        # frac_* (already in [0,1])
-PE_SLICE   = slice(15, 25)                      # the 10 Laplacian PE dims of cell_x
+_IDENT_CELL_RAW = [4, 5, 6]                      # is_seq/inv/buf   (filler/diode are DEAD)
+IDENT_NET       = [1, 2, 3]                      # is_io/is_clock/is_reset
 #   design_features 18 (insertion order in build_graph.py):
 #     0 n_cells 1 n_nets 2 n_pins 3 total_cell_area 4-8 frac_* 9 fanout_mean
 #     10 fanout_max 11 fanout_p90 12-14 frac_*pin 15 clock_fanout 16 n_clock 17 n_reset
-LOG_DF   = [0, 1, 2, 3, 9, 10, 11, 15, 16, 17]  # counts / areas / fanout magnitudes
+_IDENT_DF_RAW = [4, 5, 6, 12, 13, 14]            # frac_* in [0,1]  (frac_filler/diode DEAD)
+_LOG_DF_RAW   = [0, 1, 2, 3, 9, 10, 11, 15, 16, 17]   # counts / areas / fanout magnitudes
 
 def _pre(a, idx):
     """log1p the heavy-tailed magnitude dims; leave flags/fractions/PE alone."""
@@ -97,6 +116,10 @@ def _stats(a, ident=()):
       absolute 1e-6 threshold misses, leaving it to emit a constant 1.0 from float dust.
     ident dims: indicators pass through untouched (m=0, s=1) — see IDENT_* above.
     """
+    # float64: a float32 mean(0) over ~343k rows accumulates enough error to inflate a truly
+    # constant column's std (height: true 4.8e-07 -> 0.0125), so the guard below never fired
+    # and height was z-scored by float dust. Verified.
+    a = np.asarray(a, np.float64)
     m, s = a.mean(0), a.std(0)
     dead = s < 1e-6 * (np.abs(m) + 1.0)
     m = np.where(dead, 0.0, m); s = np.where(dead, 1.0, s + 1e-6)
@@ -104,11 +127,38 @@ def _stats(a, ident=()):
         m[list(ident)] = 0.0; s[list(ident)] = 1.0
     return m.astype(np.float32), s.astype(np.float32), dead
 
+# DEAD input dims — verified identically constant across ALL 1944 flows, so they carry zero
+# information and are dropped (not merely zeroed):
+#   cell_x[1]  height     — every sky130 std cell has the same height (it IS the row height)
+#   cell_x[7]  is_filler  — fillers are not inserted until after placement
+#   cell_x[8]  is_diode   — likewise
+#   df_vals[7] frac_filler, df_vals[8] frac_diode — same two, at design level
+DEAD_CELL = [1, 7, 8]
+DEAD_DF   = [7, 8]
+KEEP_CELL = [i for i in range(15) if i not in DEAD_CELL]     # 12 real library dims
+KEEP_DF   = [i for i in range(18) if i not in DEAD_DF]       # 16 real design dims
+
+# remap the RAW-layout index lists into the post-drop layout (single source of truth)
+_c = {raw: new for new, raw in enumerate(KEEP_CELL)}
+_f = {raw: new for new, raw in enumerate(KEEP_DF)}
+LOG_CELL   = [_c[i] for i in _LOG_CELL_RAW]
+IDENT_CELL = [_c[i] for i in _IDENT_CELL_RAW]
+LOG_DF     = [_f[i] for i in _LOG_DF_RAW]
+IDENT_DF   = [_f[i] for i in _IDENT_DF_RAW]
+CELL_IN    = len(KEEP_CELL) + 10          # 12 library + 10 PE = 22
+DF_IN      = len(KEEP_DF)                 # 16
+PE_SLICE   = slice(len(KEEP_CELL), CELL_IN)   # the 10 PE dims, post-drop
+
 def _cellfeat(d):
-    """cell_x (15) ++ per-design-standardized Laplacian PE (10) -> (C,25).
+    """cell_x (15 -> 12 live dims) ++ Laplacian PE (10) -> (C,22).
     Single source of truth: set_norm() and load_graph() BOTH go through this, so the
     stats can never drift from what the model is actually fed."""
-    return np.nan_to_num(np.concatenate([d["cell_x"], _pe_norm(d["pe_cell"])], 1))
+    cx = np.asarray(d["cell_x"])[:, KEEP_CELL]
+    return np.nan_to_num(np.concatenate([cx, _pe_norm(d["pe_cell"])], 1))
+
+def _dffeat(d):
+    """design_features (18 -> 16 live dims)."""
+    return np.nan_to_num(np.asarray(d["df_vals"])[KEEP_DF])
 
 def _pe_norm(pe):
     """Laplacian PE: passed through RAW, exactly as DE-HNN does. Do not "normalize" it.
@@ -145,7 +195,7 @@ def set_norm(train_designs, force=False):
         for p in fl[:2]:                                    # graph feats barely move with knobs
             d = np.load(p, allow_pickle=True)
             cx.append(_pre(_cellfeat(d), LOG_CELL))
-            nx.append(_pre(d["net_x"], LOG_NET)); df.append(_pre(d["df_vals"], LOG_DF))
+            nx.append(_pre(d["net_x"], LOG_NET)); df.append(_pre(_dffeat(d), LOG_DF))
         for p in fl[::11][:10]:                             # per-net targets DO move with knobs
             d = np.load(p, allow_pickle=True)
             a = d["net_hpwl"];   ynh.append(np.log(a[np.isfinite(a) & (a > 0)]))
@@ -205,14 +255,17 @@ def _z(k, v):
 def load_graph(flow_id, device="cpu"):
     d = np.load(f"{CACHE}/{flow_id}.npz", allow_pickle=True)
     m = meta().loc[flow_id]; nm = norm()
-    ct = d["cell_type"].astype(np.int64); ct[ct < 0] = N_TYPES - 1
+    # cached ids are row indices into the 12x-repeated parquet -> remap to the dense 441-type
+    # vocabulary (see type_remap). Unknown (-1) -> UNK slot.
+    ct = d["cell_type"].astype(np.int64)
+    ct = np.where(ct < 0, UNK_TYPE, type_remap()[np.clip(ct, 0, None)])
     ed = torch.tensor(d["edge_driver"], dtype=torch.long)
     es = torch.tensor(d["edge_sink"],   dtype=torch.long)
     t  = lambda a, dt=torch.float: torch.tensor(np.asarray(a), dtype=dt)
     # log1p the heavy-tailed magnitude dims, THEN z-score (train-fold stats). Must match set_norm().
     cell_x = (_pre(_cellfeat(d), LOG_CELL) - nm["cx_m"]) / nm["cx_s"]
     net_x  = (_pre(d["net_x"],  LOG_NET) - nm["nx_m"]) / nm["nx_s"]
-    dfeat  = (_pre(d["df_vals"], LOG_DF) - nm["df_m"]) / nm["df_s"]
+    dfeat  = (_pre(_dffeat(d), LOG_DF) - nm["df_m"]) / nm["df_s"]
     # knobs + FLOORPLAN-TIMING ANCHOR (fp_wns/fp_tns). The anchor gives the model the
     # design's baseline timing LEVEL — the part that doesn't transfer cross-design and
     # tanked WNS to R²=-0.77 without it. Leakage-free: floorplan is BEFORE placement.
@@ -310,7 +363,7 @@ class BipartiteConv(nn.Module):
 ENCODERS = {"dehnn", "dehnn_novn", "dehnn_undirected", "sage", "gat"}
 
 class FPlace(nn.Module):
-    def __init__(self, d=64, K=4, cell_in=25, net_in=4, knob=5, dfeat=18, encoder="dehnn"):
+    def __init__(self, d=64, K=4, cell_in=CELL_IN, net_in=4, knob=5, dfeat=DF_IN, encoder="dehnn"):
         super().__init__()
         assert encoder in ENCODERS, f"unknown encoder {encoder}; pick from {ENCODERS}"
         self.encoder = encoder
