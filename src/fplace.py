@@ -46,6 +46,7 @@ _META = _NORM = _T2N = None
 # Fix: a canonical 441-name vocabulary + a remap of the cached ids. Done at LOAD time so no
 # graph re-cache (and no 970MB re-upload) is needed.
 DIRECT_KNOB = bool(int(os.environ.get("DIRECT_KNOB", "1")))  # A/B: raw knobs -> dev head
+AGGR = os.environ.get("AGGR", "mean")   # A/B: sum | mean | multi (mean||max)  — see HyperConv
 N_TYPES = 442            # 441 real cell types + 1 UNK slot (index 441)
 UNK_TYPE = 441
 
@@ -123,9 +124,18 @@ IDENT_NET       = [1, 2, 3]                      # is_io/is_clock/is_reset
 # 7 METIS granularities x {span, disagreement-fraction}. Verified on our data: top-10%-longest-net
 # AUC 0.864 -> 0.937 (ethernet), mean 0.918 vs Net2's reported 0.922.
 N_PART_NET  = 14
-NET_IN      = 4 + N_PART_NET                      # 18
-_LOG_NET_RAW = [0] + list(range(4, 4 + 14, 2))    # fanout + the 7 SPAN dims (counts; frac is [0,1])
-LOG_NET      = _LOG_NET_RAW
+# ELECTRICAL net features (3): drive_strength, load/drive ratio, max sink cap.
+# Buffers are inserted for CAP/SLEW violations, NOT fanout (Kahng ISPD'26 §2.2). A driver of
+# strength D driving load C has slew ~ C/D; exceed the limit and the resizer INSERTS A BUFFER.
+# So load/drive is literally the trigger condition, and we fed the model nothing about it.
+# MEASURED first: driven_cap alone is 96% correlated with fanout (redundant, NOT added);
+# load/drive is only 62% correlated with fanout => ~38% new information. That is the one.
+N_ELEC_NET  = 3
+NET_IN      = 4 + N_PART_NET + N_ELEC_NET         # 21
+_PART0, _ELEC0 = 4, 4 + N_PART_NET
+LOG_NET     = ([0]                                   # fanout
+               + list(range(_PART0, _PART0 + 14, 2)) # the 7 partition SPAN dims (frac is [0,1])
+               + [_ELEC0, _ELEC0 + 1, _ELEC0 + 2])   # drive, load/drive, max_cap (heavy tails)
 #   design_features 18 (insertion order in build_graph.py):
 #     0 n_cells 1 n_nets 2 n_pins 3 total_cell_area 4-8 frac_* 9 fanout_mean
 #     10 fanout_max 11 fanout_p90 12-14 frac_*pin 15 clock_fanout 16 n_clock 17 n_reset
@@ -218,9 +228,10 @@ def _netfeat(d, flow_id):
     design (scripts/add_partition_features.py) and shared."""
     dsg = flow_id.rsplit("-", 1)[0]
     pf  = np.load(f"{ROOT}/cache/part/{dsg}.npz")["part_net"]
+    ef  = np.load(f"{ROOT}/cache/elec/{dsg}.npz")["elec_net"]
     nx  = np.asarray(d["net_x"])
-    assert len(pf) == len(nx), f"{flow_id}: part {len(pf)} vs nets {len(nx)}"
-    return np.nan_to_num(np.concatenate([nx, pf], 1))
+    assert len(pf) == len(nx) == len(ef), f"{flow_id}: part {len(pf)} elec {len(ef)} nets {len(nx)}"
+    return np.nan_to_num(np.concatenate([nx, pf, ef], 1))
 
 def _pe_norm(pe):
     """Laplacian PE, RMS-normalized per design. Sign is handled by the model (SignNet), NOT here.
@@ -495,20 +506,43 @@ class HyperConv(nn.Module):
     (train_all_cross.py:70-78). Mean-aggregation achieves the same normalization in one step
     and keeps every net (we can't afford to drop the clock net — it drives timing).
     """
-    def __init__(self, d):
+    def __init__(self, d, aggr=None):
         super().__init__()
+        # AGGR is an A/B FLAG, because neither sum NOR mean is obviously right and we should
+        # MEASURE rather than assume:
+        #   sum  -> a net's message scales with fanout. Measured: clock net |msg| 97x a 2-pin net.
+        #   mean -> normalized, BUT: HPWL is a half-perimeter = a MAX-MIN SPAN. A mean provably
+        #           CANNOT compute an extremal statistic of its neighbours. So mean-aggregating
+        #           cells into a net is structurally mismatched to the target we ask it to predict.
+        #   multi -> [mean || max || std] concatenated: the net sees CENTER, EXTREME and SPREAD.
+        #           This is the one that can actually express a span. Costs 3x the net-update width.
+        # DE-HNN uses sum + gcn_norm edge weights + a fanout>=3000 drop. We have neither of the
+        # latter two, so raw sum is not even their configuration.
+        self.aggr = aggr or AGGR
+        super_wide = 2 if self.aggr == "multi" else 1   # multi = [mean || max]
         self.lin_node, self.lin_net = Seq(Linear(d, d)), Seq(Linear(d, d))
-        self.psi = Seq(Linear(d*3, d), ReLU(), Linear(d, d))   # net update
-        self.mlp = Seq(Linear(d*3, d), ReLU(), Linear(d, d))   # cell update
-        self.forward_conv = SimpleConv(aggr="mean")            # cells -> nets  (degree-normalized)
-        self.back_conv    = SimpleConv(aggr="mean")            # nets  -> cells
+        self.psi = Seq(Linear(d*(1 + 2*super_wide), d), ReLU(), Linear(d, d))   # net update
+        self.mlp = Seq(Linear(d*3, d), ReLU(), Linear(d, d))                    # cell update
+        if self.aggr == "multi":
+            self.convs_f = nn.ModuleList([SimpleConv(aggr=a) for a in ("mean", "max")])
+        else:
+            self.forward_conv = SimpleConv(aggr=self.aggr)
+        self.back_conv = SimpleConv(aggr="mean")               # nets -> cells: always mean
+
+    def _agg(self, h, h_net, ei):
+        """cells -> nets. `multi` concatenates mean AND max so the net can see a SPAN, not just
+        a centre — HPWL is a max-min extent, which a mean cannot represent."""
+        if self.aggr == "multi":
+            return torch.cat([c((h, h_net), ei) for c in self.convs_f], 1)
+        return self.forward_conv((h, h_net), ei)
 
     def forward(self, x, x_net, ntn, ttype, ntc):
         h_net = self.lin_net(x_net) + x_net
         h     = self.lin_node(x)    + x
         sm, km = ttype == 1, ttype == 0                        # source(driver) / sink
-        h_net_source = self.forward_conv((h, h_net), ntn[:, sm]) + h_net
-        h_net_sink   = self.forward_conv((h, h_net), ntn[:, km]) + h_net
+        rep = 2 if self.aggr == "multi" else 1
+        h_net_source = self._agg(h, h_net, ntn[:, sm]) + h_net.repeat(1, rep)
+        h_net_sink   = self._agg(h, h_net, ntn[:, km]) + h_net.repeat(1, rep)
         h_net = self.psi(torch.cat([h_net, h_net_sink, h_net_source], 1)) + x_net
         h_source = self.back_conv((h_net, h), ntc[:, sm]) + h
         h_sink   = self.back_conv((h_net, h), ntc[:, km]) + h
