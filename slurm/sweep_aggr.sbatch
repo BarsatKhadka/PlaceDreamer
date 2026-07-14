@@ -5,7 +5,7 @@
 #SBATCH --cpus-per-task=4
 #SBATCH --mem=32G
 #SBATCH --time=24:00:00
-#SBATCH --array=0-8                 # 3 aggregations x 3 CV folds
+#SBATCH --array=0-11                # 4 aggregations x 3 CV folds
 #SBATCH --output=logs/%x_%A_%a.out
 #SBATCH --error=logs/%x_%A_%a.err
 #SBATCH --exclude=node049
@@ -17,10 +17,13 @@
 #   mean  normalized — BUT HPWL is a half-perimeter = a MAX-MIN SPAN, and a mean provably CANNOT
 #         compute an extremal statistic of its neighbours. Structurally mismatched to the target.
 #   multi [mean || max] concatenated: the net sees CENTRE and EXTREME, so it can express a span.
+#   gcn   DE-HNN's ACTUAL aggregator (train_all_cross.py:85-87): sum weighted by
+#         1/sqrt(deg_i*deg_j). They use NEITHER raw sum NOR mean — we had never run their config.
 #
-#   task 0,1,2 -> AGGR=sum    folds 0,1,2
-#   task 3,4,5 -> AGGR=mean   folds 0,1,2
-#   task 6,7,8 -> AGGR=multi  folds 0,1,2
+#   task  0,1,2  -> AGGR=sum    folds 0,1,2
+#   task  3,4,5  -> AGGR=mean   folds 0,1,2
+#   task  6,7,8  -> AGGR=multi  folds 0,1,2
+#   task 9,10,11 -> AGGR=gcn    folds 0,1,2
 #
 # Everything else identical (dehnn encoder, same features, same loss, same folds).
 #
@@ -40,7 +43,8 @@ case $((IDX / 3)) in
   0) AGGR=sum   ;;
   1) AGGR=mean  ;;
   2) AGGR=multi ;;
-  *) echo "bad array index $IDX (expected 0-8)" >&2; exit 1 ;;
+  3) AGGR=gcn   ;;    # DE-HNN's real aggregator
+  *) echo "bad array index $IDX (expected 0-11)" >&2; exit 1 ;;
 esac
 export AGGR
 export FOLD=$((IDX % 3))

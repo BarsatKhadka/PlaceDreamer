@@ -46,7 +46,10 @@ _META = _NORM = _T2N = None
 # Fix: a canonical 441-name vocabulary + a remap of the cached ids. Done at LOAD time so no
 # graph re-cache (and no 970MB re-upload) is needed.
 DIRECT_KNOB = bool(int(os.environ.get("DIRECT_KNOB", "1")))  # A/B: raw knobs -> dev head
-AGGR = os.environ.get("AGGR", "mean")   # A/B: sum | mean | multi (mean||max)  — see HyperConv
+AGGR = os.environ.get("AGGR", "mean")   # A/B: sum | mean | multi | gcn  — see HyperConv
+FUSE = os.environ.get("FUSE", "concat") # A/B: how the cell encoder fuses its 3 sources
+# NOTE: DE-HNN uses NEITHER sum NOR mean. They use gcn_norm-weighted sum
+# (train_all_cross.py:85-87): each edge weighted 1/sqrt(deg_i*deg_j). AGGR=gcn is that.
 N_TYPES = 442            # 441 real cell types + 1 UNK slot (index 441)
 UNK_TYPE = 441
 
@@ -525,15 +528,25 @@ class HyperConv(nn.Module):
         self.mlp = Seq(Linear(d*3, d), ReLU(), Linear(d, d))                    # cell update
         if self.aggr == "multi":
             self.convs_f = nn.ModuleList([SimpleConv(aggr=a) for a in ("mean", "max")])
+        elif self.aggr == "gcn":
+            self.forward_conv = SimpleConv(aggr="sum")     # weights supplied per-edge (gcn_norm)
         else:
             self.forward_conv = SimpleConv(aggr=self.aggr)
         self.back_conv = SimpleConv(aggr="mean")               # nets -> cells: always mean
 
     def _agg(self, h, h_net, ei):
-        """cells -> nets. `multi` concatenates mean AND max so the net can see a SPAN, not just
-        a centre — HPWL is a max-min extent, which a mean cannot represent."""
+        """cells -> nets.
+        multi: concat mean AND max so the net can see a SPAN, not just a centre — HPWL is a
+               max-min extent, which a mean provably cannot represent.
+        gcn:   DE-HNN's ACTUAL aggregator — sum weighted by 1/sqrt(deg_i*deg_j) (gcn_norm).
+               They use neither raw sum nor mean."""
         if self.aggr == "multi":
             return torch.cat([c((h, h_net), ei) for c in self.convs_f], 1)
+        if self.aggr == "gcn":
+            from torch_geometric.nn.conv.gcn_conv import gcn_norm
+            ei2, w = gcn_norm(ei, add_self_loops=False,
+                              num_nodes=max(h.size(0), h_net.size(0)))
+            return self.forward_conv((h, h_net), ei2, w)
         return self.forward_conv((h, h_net), ei)
 
     def forward(self, x, x_net, ntn, ttype, ntc):
@@ -606,6 +619,18 @@ class FPlace(nn.Module):
         self.net_encoder  = Seq(Linear(net_in, d),  LeakyReLU(), Linear(d, d))
         self.type_emb = nn.Embedding(N_TYPES, d)
 
+        # HOW THE CELL ENCODER FUSES ITS THREE SOURCES — library / cell-type / structure(PE).
+        # It used to ADD them:  h = MLP(library) + type_emb + SignNet(PE).
+        # Addition ENTANGLES: all three land in the same 64 dims superimposed, so the model
+        # cannot cleanly separate "I am a NAND2" from "I sit HERE in the graph" — it has to
+        # learn to keep them separable and may never manage it. And I never chose this: DE-HNN's
+        # node_encoder is a plain MLP and I bolted type_emb + SignNet on with `+` because it was
+        # the path of least resistance.
+        # CONCAT keeps them distinct and lets a fusion MLP decide how to combine them.
+        self.fuse = FUSE
+        if self.fuse == "concat":
+            self.fuse_mlp = Seq(Linear(3 * d, d), LeakyReLU(), Linear(d, d))
+
         # --- VN (DE-HNN exact): cells only, mean+max pooling, concat-MLP broadcast ---
         # VN pools the SIGN-INVARIANT features (library dims + SignNet PE embedding), NOT raw
         # cell_x — pooling raw PE would leak the arbitrary sign straight back into the VN.
@@ -676,8 +701,12 @@ class FPlace(nn.Module):
     def forward(self, g):
         # split raw cell features: library dims | Laplacian PE (sign-ambiguous -> SignNet)
         lib, pe = g["cell_x"][:, :PE_SLICE.start], g["cell_x"][:, PE_SLICE]
-        feat  = torch.cat([lib, self.encode_pe(pe)], 1)       # sign-INVARIANT cell features
-        h     = self.node_encoder(lib) + self.type_emb(g["cell_type"]) + self.encode_pe(pe)
+        e_lib, e_typ, e_pe = self.node_encoder(lib), self.type_emb(g["cell_type"]), self.encode_pe(pe)
+        feat  = torch.cat([lib, e_pe], 1)                     # sign-INVARIANT cell features (for VN)
+        # CONCAT-then-fuse (default) keeps library / type / structure in separate subspaces;
+        # SUM superimposes all three in the same 64 dims. See the note in __init__.
+        h = (self.fuse_mlp(torch.cat([e_lib, e_typ, e_pe], 1)) if self.fuse == "concat"
+             else e_lib + e_typ + e_pe)
         h_net = self.net_encoder(g["net_x"])
         part, nvn = g["part_cell"], g["num_vn"]
         ctx = self.ctx(torch.cat([g["knobs"], g["dfeat"]]))
