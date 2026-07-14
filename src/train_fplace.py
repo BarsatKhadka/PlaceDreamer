@@ -34,7 +34,8 @@ import os, sys, glob, json, time, random
 import numpy as np, pandas as pd, torch
 from scipy.stats import pearsonr
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from fplace import FPlace, load_graph, gnll, meta, CACHE, set_norm, denorm
+from fplace import (FPlace, load_graph, gnll, meta, CACHE, set_norm, denorm,
+                    norm, recon, GLOBAL_TARGETS)
 
 E = os.environ.get
 DEV     = "cuda" if torch.cuda.is_available() else "cpu"
@@ -60,7 +61,8 @@ OUT     = E("OUT", f"runs/{ENCODER}")
 W = dict(net_hpwl=float(E("W_NETHPWL", 5)),        # dense: ~10k nets/flow
          endpt=float(E("W_ENDPT", 3)),             # dense: ~700 endpoints/flow
          tot_hpwl=float(E("W_TOT", 1)), buf_area=float(E("W_BUFA", 1)),
-         buf_cnt=float(E("W_BUFC", 1)))
+         buf_cnt=float(E("W_BUFC", 1)),
+         dev=float(E("W_DEV", 3)))                 # knob-DEVIATION weight (the thing we want)
 torch.manual_seed(SEED); random.seed(SEED); np.random.seed(SEED)
 os.makedirs(OUT, exist_ok=True)
 
@@ -103,10 +105,13 @@ def flows_of(designs):
 
 def wloss(out, g, nll=True):
     L = (W["net_hpwl"] * gnll(out["net_hpwl"], g["y_net_hpwl"], g["m_net_hpwl"], nll)
-       + W["tot_hpwl"] * gnll(out["tot_hpwl"], g["y_tot_hpwl"], None, nll)
-       + W["buf_area"] * gnll(out["buf_area"], g["y_buf_area"], None, nll)
        + W["endpt"]    * gnll(out["endpt"],    g["y_endpt"],    g["m_endpt"], nll))
-    if g["has_bufcnt"]: L = L + W["buf_cnt"] * gnll(out["buf_cnt"], g["y_buf_cnt"], None, nll)
+    # global targets: LEVEL + knob DEVIATION, both O(1). The deviation is up-weighted because
+    # it IS the thing f_place exists to predict — the level is ~n_cells and nearly free.
+    for k in GLOBAL_TARGETS:
+        if k == "buf_cnt" and not g["has_bufcnt"]: continue
+        L = L + W[k]          * gnll(out[f"{k}_lvl"], g[f"y_{k}_lvl"], None, nll)
+        L = L + W["dev"] * W[k] * gnll(out[f"{k}_dev"], g[f"y_{k}_dev"], None, nll)
     return L
 
 @torch.no_grad()
@@ -114,10 +119,11 @@ def evaluate(model, flows):
     """collect predictions vs truth for every target."""
     model.eval()
     NET  = ("net_hpwl", "endpt")                       # per-node (masked) heads: net & endpoint
-    GLOB = ("tot_hpwl","buf_area","buf_cnt")           # per-flow scalar heads
+    GLOB = ("tot_hpwl","buf_area","buf_cnt")           # per-flow scalars (level + deviation)
+    DEVK = tuple(k+"_dev" for k in GLOB)               # the KNOB RESPONSE, scored on its own
     DERIV = ("wns","tns")                              # NOT heads — read out from endpt per flow
-    LOGK = ("net_hpwl","tot_hpwl","buf_area","buf_cnt")# log targets -> rel-err via expm1
-    P = {k: [] for k in NET+GLOB+DERIV}
+    LOGK = ("net_hpwl","tot_hpwl","buf_area","buf_cnt")# log targets -> real units via exp
+    P = {k: [] for k in NET+GLOB+DEVK+DERIV}
     T = {k: [] for k in P}; sig = {k: [] for k in NET+GLOB}; dz = []
     for f in flows:
         g = load_graph(f, DEV); o = model(g)
@@ -125,9 +131,15 @@ def evaluate(model, flows):
             m = g[mk]
             P[k].append(o[k][m,0].cpu().numpy()); T[k].append(g[yk][m].cpu().numpy())
             sig[k].append(o[k][m,1].cpu().numpy())
+        nm = norm()
         for k in GLOB:
-            P[k].append(np.array([o[k][0].item()])); T[k].append(np.array([g[f"y_{k}"].item()]))
-            sig[k].append(np.array([o[k][1].item()]))
+            # reconstruct absolute log(target) = level + deviation; also score the DEVIATION
+            # head on its own — that is the knob response, the thing f_place exists for.
+            lv, dv = o[f"{k}_lvl"][0].item(), o[f"{k}_dev"][0].item()
+            P[k].append(np.array([recon(k, lv, dv, nm)]))
+            T[k].append(np.array([g[f"y_{k}"].item()]))          # raw log
+            sig[k].append(np.array([o[f"{k}_dev"][1].item()]))
+            P[k+"_dev"].append(np.array([dv])); T[k+"_dev"].append(np.array([g[f"y_{k}_dev"].item()]))
         # WNS/TNS READOUT from per-endpoint slack (denorm to raw slack), vs recorded truth.
         # append every flow (NaN if no endpoints) so wns/tns stay aligned with dz.
         ep = g["ep_idx"]
@@ -140,7 +152,7 @@ def evaluate(model, flows):
         P["tns"].append([tns_p]); T["tns"].append([g["tns_true"]])
         dz.append(f.rsplit("-",1)[0])
     res = {}
-    for k in NET+GLOB+DERIV:
+    for k in NET+GLOB+DEVK+DERIV:
         p, t = np.concatenate([np.asarray(x) for x in P[k]]), np.concatenate([np.asarray(x) for x in T[k]])
         ok = np.isfinite(p) & np.isfinite(t); p, t = p[ok], t[ok]
         if len(t) < 3 or t.std() < 1e-9: continue
@@ -149,12 +161,18 @@ def evaluate(model, flows):
         # A pooled R2 is a ratio against variance, and ~99% of the variance in the global
         # targets is merely "how big is this design" — so R2 flattered us badly. |target-pred|
         # cannot lie that way.
-        if k in LOGK:                      # standardized log -> real units (nm, um^2, count)
+        if k in GLOB:                      # p,t are RAW LOG (reconstructed level+dev) -> real units
+            rp, rt = np.exp(p), np.exp(t)
+            rel = np.abs(rp - rt) / np.maximum(np.abs(rt), 1e-9)
+        elif k == "net_hpwl":              # standardized log -> real units
             rp, rt = np.exp(denorm(k, p)), np.exp(denorm(k, t))
-            rel = np.abs(rp - rt) / np.maximum(np.abs(rt), 1e-9)         # relative, scale-free
+            rel = np.abs(rp - rt) / np.maximum(np.abs(rt), 1e-9)
         elif k == "endpt":                 # standardized slack -> ns
             rp, rt = denorm("endpt", p), denorm("endpt", t)
-            rel = np.abs(rp - rt)                                        # ns (absolute)
+            rel = np.abs(rp - rt)
+        elif k in DEVK:                    # the KNOB RESPONSE, in within-design std units
+            rp, rt = p, t
+            rel = np.abs(rp - rt)
         else:                              # wns/tns: already raw ns
             rp, rt = p, t
             rel = np.abs(rp - rt)
@@ -181,7 +199,7 @@ def evaluate(model, flows):
     # the only thing f_place exists to predict. Reported as R2 (not Pearson r: a design can have
     # r=0.9 with a NEGATIVE within-design R2 if the slope or bias is wrong).
     dd_all = np.array(dz)
-    for k in GLOB + DERIV:
+    for k in GLOB + DEVK + DERIV:
         if k not in res: continue
         p = np.concatenate([np.asarray(x) for x in P[k]]); t = np.concatenate([np.asarray(x) for x in T[k]])
         dd = dd_all[:len(p)]
@@ -256,15 +274,19 @@ def run_fold(fi, test_designs, all_designs):
         # variance is design size, so it flattered us. Negated so "higher is better" for sched.
         SEL = ("net_hpwl", "tot_hpwl", "buf_cnt", "wns")
         errs = [v[k]["med_rel"] for k in SEL if k in v and np.isfinite(v[k]["med_rel"])]
-        score = -float(np.mean(errs)) if errs else -1e9
+        # + the KNOB RESPONSE (dev-head R2, higher is better) — the thing f_place exists for.
+        devs = [v[k+"_dev"]["r2"] for k in GLOBAL_TARGETS
+                if k+"_dev" in v and np.isfinite(v[k+"_dev"]["r2"])]
+        score = (-float(np.mean(errs)) if errs else -1e9) + (float(np.mean(devs)) if devs else 0.0)
         sched.step(score)
         lr_now = opt.param_groups[0]["lr"]
         e_ = lambda k: v[k]["med_rel"] if k in v else float("nan")
+        r_ = lambda k: v[k].get("r2", float("nan")) if k in v else float("nan")
         w_ = lambda k: v[k].get("within_r2", float("nan")) if k in v else float("nan")
-        print(f"  ep {ep:3d} tr {tot/len(tr):7.3f} | VAL(held-out designs) med-rel-err: "
-              f"hpwl {e_('net_hpwl')*100:5.1f}% tot {e_('tot_hpwl')*100:5.1f}% "
-              f"bufC {e_('buf_cnt')*100:5.1f}% | wns {e_('wns'):.3f}ns ep {e_('endpt'):.3f}ns "
-              f"| within-R² tot {w_('tot_hpwl'):+.2f} wns {w_('wns'):+.2f} "
+        print(f"  ep {ep:3d} tr {tot/len(tr):7.3f} | VAL(held-out) err: hpwl {e_('net_hpwl')*100:5.1f}% "
+              f"tot {e_('tot_hpwl')*100:5.1f}% bufC {e_('buf_cnt')*100:5.1f}% wns {e_('wns'):.2f}ns "
+              f"|| KNOB-RESPONSE R²: tot {r_('tot_hpwl_dev'):+.3f} bufA {r_('buf_area_dev'):+.3f} "
+              f"bufC {r_('buf_cnt_dev'):+.3f} | within-R² tot {w_('tot_hpwl'):+.2f} "
               f"| lr {lr_now:.1e} ({time.time()-t0:.0f}s)", flush=True)
         if score > best + 1e-4:
             best, best_state, patience = score, {k:v.detach().cpu().clone() for k,v in model.state_dict().items()}, 0

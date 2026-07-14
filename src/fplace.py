@@ -82,8 +82,13 @@ def meta():
 #     TNS readout undercounts by construction — a PERFECT endpoint predictor scores tns R2=0.34.
 #   - primary-output endpoints are not cell nodes and are dropped (0% on the high-TNS designs;
 #     50% on wb_dma, where the min-readout is consequently wrong). OPEN.
-LOG_TARGETS = ("net_hpwl", "tot_hpwl", "buf_area", "buf_cnt")
-TARGETS     = LOG_TARGETS
+LOG_TARGETS    = ("net_hpwl", "tot_hpwl", "buf_area", "buf_cnt")
+TARGETS        = LOG_TARGETS
+GLOBAL_TARGETS = ("tot_hpwl", "buf_area", "buf_cnt")   # each -> a LEVEL head + a DEVIATION head
+
+def recon(k, lvl, dev, nm):
+    """level + deviation  ->  log(target).  Inverse of the decomposition in set_norm."""
+    return (lvl * float(nm[f"L_{k}_s"]) + float(nm[f"L_{k}_m"])) + dev * float(nm[f"W_{k}"])
 
 def _slog(x):
     """signed log1p: sign(x)*log1p(|x|). Handles both signs and crushes the fp_wns tail
@@ -269,10 +274,48 @@ def set_norm(train_designs, force=False):
             es.append(np.load(p)["ep_slack"])
     es = np.concatenate(es) if es else np.zeros(1, np.float32)
     _NORM["y_endpt_m"] = np.float32(es.mean()); _NORM["y_endpt_s"] = np.float32(es.std() + 1e-6)
+
+    # ---- GLOBAL TARGET DECOMPOSITION:  log(y) = DESIGN LEVEL + KNOB DEVIATION ----
+    # THE bug that made within-R2 = -14. We z-scored by the CROSS-design std, but the knob
+    # effect lives inside the WITHIN-design std, and those differ by 12-33x:
+    #     tot_hpwl  cross 1.764  within 0.152  -> knob signal arrives as +-0.086 std units
+    #     buf_area  cross 1.514  within 0.074  -> +-0.049
+    #     buf_cnt   cross 1.190  within 0.036  -> +-0.030
+    # i.e. the ONLY thing f_place exists to predict was ~1% of the target's variance, and the
+    # optimizer (correctly) ignored it and nailed the design level instead.
+    # Fix: predict the two parts SEPARATELY, each standardized to O(1):
+    #     level_k = (mean_of_design - M_k) / S_k          <- easy; ~n_cells
+    #     dev_k   = (y - mean_of_design) / W_k            <- THE KNOB RESPONSE, now O(1)
+    # reconstruct: log(y) = (level*S_k + M_k) + dev*W_k
+    # mu_design is a LABEL statistic used only to FORM the targets — the model never sees it,
+    # so there is no leakage. (Test-design means are used only inside evaluate(), which is what
+    # "within-design error" means by definition.)
+    m_all = meta()
+    dcol  = m_all.index.str.replace(r"-\d+$", "", regex=True)
+    for k, col, off in (("tot_hpwl","total_hpwl",0.0), ("buf_area","buffer_area",1.0),
+                        ("buf_cnt","buffer_count",1.0)):
+        y = np.log(np.maximum(m_all[col].values.astype(np.float64), 0) + off + 1e-12)
+        s = pd.Series(y, index=dcol)
+        mu_d = s.groupby(level=0).mean()                       # per-design LEVEL (all designs)
+        w_d  = s.groupby(level=0).std()                        # per-design WITHIN std
+        tr_d = [d for d in mu_d.index if d in set(train_designs)]
+        _NORM[f"L_{k}_m"] = np.float32(mu_d[tr_d].mean())      # M_k  (train designs only)
+        _NORM[f"L_{k}_s"] = np.float32(mu_d[tr_d].std() + 1e-6)  # S_k
+        _NORM[f"W_{k}"]   = np.float32(w_d[tr_d].mean() + 1e-6)  # W_k
+        _NORM[f"MU_{k}_keys"] = np.array(mu_d.index)           # per-design level lookup
+        _NORM[f"MU_{k}_vals"] = mu_d.values.astype(np.float32)
     # floorplan-timing ANCHOR inputs (conditioning, not targets): signed-log + standardize
     for k in ("fp_wns", "fp_tns"):
         v = _slog(mt[k].values.astype(np.float32)); v = v[np.isfinite(v)]
         _NORM[f"a_{k}_m"] = np.float32(v.mean()); _NORM[f"a_{k}_s"] = np.float32(v.std() + 1e-6)
+    # KNOBS: properly z-scored (train designs only). They used to be divided by ad-hoc constants
+    # I invented (clock/10, util/30, aspect raw) -> utilization arrived with std ~0.27 and a mean
+    # of ~1.0, sitting next to unit-variance z-scored anchors, so the ctx MLP was dominated by
+    # the anchors and the knobs were a small offset. Utilization is the knob that drives the
+    # target hardest (corr -0.75..-0.86 with log tot_hpwl). It must not be the quietest input.
+    for k in ("clock_period", "utilization", "aspect_ratio"):
+        v = mt[k].values.astype(np.float32)
+        _NORM[f"k_{k}_m"] = np.float32(v.mean()); _NORM[f"k_{k}_s"] = np.float32(v.std() + 1e-6)
     np.savez(f, **_NORM)
     print(f"[norm] built from {len(train_designs)} TRAIN designs → {os.path.basename(f)}")
     for k in TARGETS:
@@ -319,8 +362,9 @@ def load_graph(flow_id, device="cpu"):
     # tanked WNS to R²=-0.77 without it. Leakage-free: floorplan is BEFORE placement.
     a_wns = (_slog(float(m.fp_wns)) - nm["a_fp_wns_m"]) / nm["a_fp_wns_s"]
     a_tns = (_slog(float(m.fp_tns)) - nm["a_fp_tns_m"]) / nm["a_fp_tns_s"]
-    knb    = np.array([m.clock_period/10.0, m.utilization/30.0, m.aspect_ratio,
-                       a_wns, a_tns], np.float32)
+    kz = lambda k: (float(m[k]) - float(nm[f"k_{k}_m"])) / float(nm[f"k_{k}_s"])
+    knb = np.array([kz("clock_period"), kz("utilization"), kz("aspect_ratio"),
+                    a_wns, a_tns], np.float32)     # all 5 now unit-variance, zero-mean
     # VN partition, compacted to the surviving cells. Re-densify the partition ids: dropping
     # tapcells can empty a partition, and scatter(dim_size=max+1) would leave a hole.
     pc = np.asarray(d["part_cell"])[keep]
@@ -345,11 +389,22 @@ def load_graph(flow_id, device="cpu"):
         # the highest-leverage nets in the per-net head. cache/netmask marks them. (audit B2)
         m_net_hpwl=t(np.isfinite(d["net_hpwl"]) & (d["net_hpwl"] > 0)
                      & np.load(f"{ROOT}/cache/netmask/{flow_id}.npz")["label_ok"], torch.bool),
-        y_tot_hpwl=_z("tot_hpwl", t(np.log(max(m.total_hpwl, 1e-6)))),
-        y_buf_area=_z("buf_area", t(np.log(max(m.buffer_area, 0) + 1.0))),
-        y_buf_cnt =_z("buf_cnt",  t(np.log(max(bufcnt, 0) + 1.0))) if np.isfinite(bufcnt) else t(0.0),
         has_bufcnt=bool(np.isfinite(bufcnt)),
     )
+    # GLOBAL targets, DECOMPOSED (see set_norm): log(y) = design_level + knob_deviation.
+    # Both parts standardized to O(1) — the knob deviation used to arrive as a +-0.03..0.09
+    # wiggle on a unit-variance target (1% of the variance) and the optimizer ignored it.
+    dsg  = flow_id.rsplit("-", 1)[0]
+    raws = dict(tot_hpwl=np.log(max(m.total_hpwl, 1e-6)),
+                buf_area=np.log(max(m.buffer_area, 0) + 1.0),
+                buf_cnt =np.log(max(bufcnt, 0) + 1.0) if np.isfinite(bufcnt) else np.nan)
+    for k in ("tot_hpwl", "buf_area", "buf_cnt"):
+        keys, vals = nm[f"MU_{k}_keys"], nm[f"MU_{k}_vals"]
+        mu_d = float(vals[np.where(keys == dsg)[0][0]])          # this design's LEVEL
+        yv   = float(raws[k])
+        g[f"y_{k}_lvl"] = t((mu_d - float(nm[f"L_{k}_m"])) / float(nm[f"L_{k}_s"]))
+        g[f"y_{k}_dev"] = t((yv - mu_d) / float(nm[f"W_{k}"])) if np.isfinite(yv) else t(0.0)
+        g[f"y_{k}"]     = t(yv)                                  # raw log, for real-unit error
     # per-ENDPOINT slack labels (register endpoints @ place_resized), standardized.
     # y_endpt is per-CELL (0 where no label); m_endpt masks the labeled endpoint cells.
     # TWO fixes here:
@@ -501,7 +556,11 @@ class FPlace(nn.Module):
         self.fc1_cell = Linear(d + d, 256)            # per-cell readout: [cell embedding, ctx skip]
         self.fc1_glob = Linear(4*d + d, 256)          # [h.mean,h.max,hn.mean,hn.max, ctx]
         self.h_net_hpwl = Linear(256, 2)
-        self.h_tot, self.h_buf_area, self.h_buf_cnt = Linear(256, 2), Linear(256, 2), Linear(256, 2)
+        # Each global target gets TWO heads: the design LEVEL (easy, ~n_cells) and the knob
+        # DEVIATION (the thing f_place exists for). Both targets are O(1), so the knob response
+        # finally gets real gradient instead of a +-0.03 wiggle on a unit-variance target.
+        self.h_lvl = nn.ModuleDict({k: Linear(256, 2) for k in GLOBAL_TARGETS})
+        self.h_dev = nn.ModuleDict({k: Linear(256, 2) for k in GLOBAL_TARGETS})
         # per-ENDPOINT slack head (per-cell). WNS=min, TNS=sum-neg are READOUTS, not heads.
         # ctx skip so clock_period + the floorplan anchor reach each endpoint's slack directly.
         self.h_endpt = Linear(256, 2)
@@ -547,9 +606,12 @@ class FPlace(nn.Module):
         hc = F.leaky_relu(self.fc1_cell(torch.cat([h, ctx.expand(h.size(0), -1)], 1)))  # per-cell
         hg = F.leaky_relu(self.fc1_glob(torch.cat([
             h.mean(0), h.max(0).values, h_net.mean(0), h_net.max(0).values, ctx])))
-        return dict(net_hpwl=self.h_net_hpwl(hn),
-                    tot_hpwl=self.h_tot(hg), buf_area=self.h_buf_area(hg), buf_cnt=self.h_buf_cnt(hg),
-                    endpt=self.h_endpt(hc))          # per-cell slack; WNS/TNS read out in train
+        o = dict(net_hpwl=self.h_net_hpwl(hn),
+                 endpt=self.h_endpt(hc))             # per-cell slack; WNS/TNS read out in train
+        for k in GLOBAL_TARGETS:                     # level + knob-deviation, both O(1)
+            o[f"{k}_lvl"] = self.h_lvl[k](hg)
+            o[f"{k}_dev"] = self.h_dev[k](hg)
+        return o
 
 LOSS   = os.environ.get("LOSS", "decoupled")     # decoupled | beta | nll | mse
 BETA   = float(os.environ.get("BETA", 0.5))      # for LOSS=beta
