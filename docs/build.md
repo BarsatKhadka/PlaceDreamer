@@ -225,3 +225,95 @@ None beat the global head. The target is not the problem — **the architecture 
 Keep from this line of work: (a) the global WNS/TNS heads, (b) the TNS sum-constraint idea,
 (c) per-endpoint slack as an AUXILIARY signal (it learns fine at +0.83 when not fighting the
 readout loss, and f_route will want it).
+
+---
+
+## Literature check — what the field actually does (and what it refuses to report)
+
+Surveyed the papers that predict placement metrics from a PRE-placement state. Findings that
+directly change what we build and how we measure.
+
+### 1. Our per-net "failure" is a documented, EXPECTED result — not a bug
+**Net² (Xie et al., ASP-DAC'21, arXiv:2011.13522, §3):** in one design they found **725 nets with
+identical driver area, cell count and one-hop neighbour info** whose post-placement lengths ranged
+**1 um to >100 um**. A model with only local features *"cannot distinguish these nets at all."*
+Their thesis: *"It is not likely to achieve high accuracy without accessing any GLOBAL information."*
+
+Our net node has 4 features (fanout + 3 flags). Collapsing to a fanout curve is exactly what the
+paper predicts. **No loss/architecture tuning fixes this** — it needs global structure.
+
+### 2. THE fix — partition-disagreement features (Net² §4.2, Alg. 2)
+Run hMETIS at **7 cell granularities** (#cells/100,200,300,500,1000,2000,3000) + 3 net
+granularities. For each edge, compute **cluster-ID DISAGREEMENT** between the two endpoints'
+neighbourhoods. Cells in different clusters get placed far apart in any good placement -> cluster
+disagreement is a **pre-placement proxy for physical distance**, which is what HPWL IS and what
+fanout can never express.
+**Their ablation (Table 7) is the kicker:** an "Edge ANN" with the partition features and NO GNN
+scores **AUC 88.2**, vs 92.2 for full Net² and 69.8 for a cell-count baseline. **The partition
+features carry most of the signal, not the message passing.**
+We ALREADY run METIS for the virtual nodes and throw the partition away. Cheapest, highest-leverage
+change available.
+
+### 3. Net features: they use 12, we use 4
+Net² Alg.1: fan-in size, fan-out size, **driver cell area**, **sum of ALL cell areas on the net**,
+plus **sum AND std of neighbouring nets' fan-in/fan-out sizes, kept SEPARATE for in- vs
+out-neighbours**. We have none of the areas, no direction split, no second-order stats.
+
+### 4. Buffering needs ELECTRICAL features (we feed none)
+GraPhSyM (arXiv:2308.03944, Table I): input cap, **driven cap**, slew, per-pin delay. Buffers are
+inserted for **slew and max-cap violations, NOT fanout** (Kahng ISPD'26 §2.2). A fanout-only model
+*structurally cannot* predict buffering. Also: GraPhSyM labels each output pin with the **summed
+area of the buffer tree attached to it** and totals ANALYTICALLY — no global pool. They name our
+exact trap: predicting an absolute post-value when the input is close to it makes the model copy
+the input.
+
+### 5. Timing: MasterRTL does NOT pool (ICCAD'23, arXiv:2311.08441, §II.B)
+Predict **per-path delay**, then compute `WNS = min(clk - delay)` and `TNS = sum(clk - delay)`
+**analytically** — so `clock_period` enters as the literal constant in the slack equation, not as a
+soft conditioning input. Then calibrate with a small tree on design scale + slack percentiles.
+
+### 6. Knob injection — LOSTIN ablated this on an UNSEEN-DESIGN split (arXiv:2201.08455 §III-A)
+Late concat of [graph emb || knob emb] WINS (3.11% area MAPE). A **knob SUPERNODE collapses to
+40.7%** — the knob signal *"is gradually diluted"* by message passing. Per-node knob broadcast is
+also called out as a failure mode. Our direct ctx-skip is on the right side of this; our VN
+injection is the thing they say fails. **Worth an ablation.**
+HARP (ICCAD'23 §IV-B2) goes further for PER-NET conditioning: a per-knob MLP that TRANSFORMS node
+embeddings (FiLM-like), then ONE more message-passing layer to propagate the knob effect. Beats
+plain concat by 12-19% RMSE. (Caveat: their eval is within-design across knobs.)
+
+### 7. HONEST CALIBRATION of our numbers
+**Nobody publishes cross-design absolute per-net HPWL error.** Net²'s full text has ZERO
+MAE/RMSE/MAPE. They report top-10%-longest-net **ROC-AUC (92.2)** and a **20-bin correlation
+(0.98, with the top 5% of nets EXCLUDED)** — binning cancels per-net error.
+**Net², MacroRank and Huang (DATE'19) ALL independently abandoned absolute regression for ranking.**
+Three SOTA papers doing that is the field telling us something.
+
+Cross-design reference points:
+  - DE-HNN cross-design per-net log2 RMSE 1.677 (Pearson 0.754) => ~3.2x multiplicative tail error
+  - MacroRank cross-design TOTAL-WL MRE: **24-49%**
+  - MasterRTL cross-design WNS: R 0.92, **MAPE 27%** — nobody has shown <15%
+  - Ghose cross-design node-level congestion Pearson **0.23-0.31** <- the real SOTA for hard
+    cross-design node-level regression. Anyone reporting 0.9 is reporting WITHIN-design.
+=> **our ~40% median per-net rel err (cross-design) is in the plausible band, and is MORE than
+   anyone else is willing to report.** We are not an outlier.
+
+### 8. The ceiling (stated, not guessed)
+Per-net absolute HPWL from a pre-placement netlist is **fundamentally under-determined** — Net²'s
+725-net example is a proof by construction. Length is set by GLOBAL placement pressure.
+**Consensus: ranking works (AUC ~92); absolute per-net regression does not.**
+=> ADDED top-10% AUC / recall@10% / 20-bin correlation to evaluate(). f_route needs to know WHICH
+nets are long and congested, not their exact length — that is a ranking problem, and it is the
+achievable one.
+
+### 9. Independent confirmation of our "coverage-limited" finding
+MasterRTL Fig.11: path-model accuracy collapses R 0.93 -> 0.46 as training designs shrink; their
+fix was **generating synthetic RTL designs**, not a better model. SwiftCTS: clock power varies 8.9x
+across design families but only 10-30% across knobs within a design — the cross-design scale term
+dominates the knob term ~30x. Exactly our decomposition finding, arrived at independently.
+
+### 10. Our buffer target appears to be UNPUBLISHED
+Extensive search found no pre-placement buffer count/area predictor. Kahng's ISPD'26 contest states
+tools deliberately defer buffering to post-detailed-placement because interconnect delay can't be
+estimated earlier. Novel — but there is a headwind and no baseline. Closest reference: GraPhSyM's
+**15.6% area MAE on unrelated designs** (vs 3.86% within-family — a 4x degradation on leaving the
+training family).

@@ -130,12 +130,15 @@ def evaluate(model, flows):
     LOGK = ("net_hpwl","tot_hpwl","buf_area","buf_cnt")# log targets -> real units via exp
     P = {k: [] for k in NET+GLOB+DEVK+DERIV}
     T = {k: [] for k in P}; sig = {k: [] for k in NET+GLOB}; dz = []
+    rank_flows = []            # per-FLOW (pred, true) for the ranking metrics — see below
     for f in flows:
         g = load_graph(f, DEV); o = model(g)
         for k, mk, yk in (("net_hpwl","m_net_hpwl","y_net_hpwl"), ("endpt","m_endpt","y_endpt")):
             m = g[mk]
             P[k].append(o[k][m,0].cpu().numpy()); T[k].append(g[yk][m].cpu().numpy())
             sig[k].append(o[k][m,1].cpu().numpy())
+        rank_flows.append((o["net_hpwl"][g["m_net_hpwl"],0].cpu().numpy(),
+                           g["y_net_hpwl"][g["m_net_hpwl"]].cpu().numpy()))
         nm = norm()
         for k in GLOB:
             # reconstruct absolute log(target) = level + deviation; also score the DEVIATION
@@ -221,6 +224,44 @@ def evaluate(model, flows):
             res[k]["within_r2"] = float(np.mean(r2s))       # THE number: knob-response skill
             res[k]["within_med_ae"] = float(np.mean(rels))
             res[k]["n_designs"] = len(r2s)
+
+    # ---- RANKING metrics for per-net HPWL — the axis the FIELD actually reports.
+    # Net2 (Xie et al., ASP-DAC'21) found 725 nets in one design with IDENTICAL local features
+    # whose post-placement lengths spanned 1um to 100um. Per-net absolute length is
+    # UNDER-DETERMINED from a pre-placement netlist: length is set by global placement pressure.
+    # So Net2, MacroRank and Huang (DATE'19) all independently ABANDONED absolute regression and
+    # report RANKING instead. Net2 never publishes an MAE/RMSE/MAPE at all — they report
+    # top-10%-longest-net ROC-AUC (92.2) and a 20-BIN correlation (0.98, with the top 5% of nets
+    # EXCLUDED). The binning cancels per-net error; it measures "do long nets come out longer".
+    #
+    # This is also what the DOWNSTREAM CONSUMER needs: f_route doesn't want "this net is 47.3um",
+    # it wants "THESE are the long, congested nets". That is ranking, and it is achievable.
+    # Computed PER FLOW then averaged — ranking nets across designs would just rank by chip size.
+    if rank_flows:
+        aucs, bin_rs, top_recalls = [], [], []
+        for pf, tf in rank_flows:
+            if len(tf) < 50 or tf.std() < 1e-9: continue
+            # (a) ROC-AUC: can we identify the top-10% LONGEST nets?  (Net2's headline metric)
+            thr = np.percentile(tf, 90); lab = (tf >= thr).astype(int)
+            if 0 < lab.sum() < len(lab):
+                order = np.argsort(pf); rk = np.empty(len(pf)); rk[order] = np.arange(len(pf))
+                npos, nneg = lab.sum(), len(lab) - lab.sum()
+                aucs.append((rk[lab == 1].sum() - npos*(npos-1)/2) / (npos*nneg))
+                # (b) recall@10%: of the truly-longest 10%, how many are in our predicted top 10%?
+                pred_top = pf >= np.percentile(pf, 90)
+                top_recalls.append(float((pred_top & (lab == 1)).sum() / max(npos, 1)))
+            # (c) 20-bin correlation (Net2's other metric) — bin by TRUE length, correlate means
+            qs = np.quantile(tf, np.linspace(0, 1, 21))
+            bp, bt = [], []
+            for i in range(20):
+                m_ = (tf >= qs[i]) & (tf <= qs[i+1] if i == 19 else tf < qs[i+1])
+                if m_.sum() >= 3: bp.append(pf[m_].mean()); bt.append(tf[m_].mean())
+            if len(bt) >= 5 and np.std(bt) > 1e-9 and np.std(bp) > 1e-9:
+                bin_rs.append(float(np.corrcoef(bp, bt)[0, 1]))
+        if aucs and "net_hpwl" in res:
+            res["net_hpwl"]["auc_top10"]    = float(np.mean(aucs))        # Net2: 92.2 (=0.922)
+            res["net_hpwl"]["recall_top10"] = float(np.mean(top_recalls))
+            res["net_hpwl"]["bin20_r"]      = float(np.mean(bin_rs)) if bin_rs else float("nan")
     return res
 
 def run_fold(fi, test_designs, all_designs):
@@ -325,7 +366,19 @@ def print_metrics(res, title):
         cz = f"{v['calib_z2']:.2f}" if "calib_z2" in v else "    -"
         print(f"  {k:9} {v['med_ae']:9.3f}{u:>1} {v['p90_ae']:9.3f}{u:>1} "
               f"{v['med_rel']*100:7.1f}% {wr:>10} {cz:>9} {v['r2']:+10.3f}", flush=True)
-    print("   (within-R² = knob-response with design size held constant — THE number."
+    if "net_hpwl" in res and "auc_top10" in res["net_hpwl"]:
+        n = res["net_hpwl"]
+        print(f"\n  RANKING (per-net HPWL) — the axis the field actually reports:")
+        print(f"      top-10% longest-net AUC  {n['auc_top10']:.3f}   "
+              f"(Net2 ASP-DAC'21, leave-design-out: 0.922)")
+        print(f"      recall@10%               {n['recall_top10']:.3f}   "
+              f"(of the truly-longest 10%, how many we rank in our top 10%)")
+        print(f"      20-bin correlation       {n['bin20_r']:.3f}   (Net2: 0.98, top 5% excluded)")
+        print("      NOTE: absolute per-net length is UNDER-DETERMINED pre-placement (Net2 found")
+        print("      725 nets with identical local features spanning 1um..100um). Net2/MacroRank/")
+        print("      Huang'19 all abandoned absolute regression for ranking. f_route needs the")
+        print("      RANKING (which nets are long/congested), not the absolute value.")
+    print("\n   (within-R² = knob-response with design size held constant — THE number."
           "  calib z² -> 1.0 = honest sigma.\n"
           "    pooled R² is ~99% design-identity for the global targets — do not trust it.)",
           flush=True)
