@@ -12,3 +12,7 @@ datasets/
 cache/
 venv/
 *.tar.gz
+
+# Results: COMMIT the logs + metrics (so we can pull them off the cluster with git pull),
+# but NEVER the model weights — a .pt is ~2MB x 9 tasks and would bloat the repo forever.
+runs/**/*.pt
