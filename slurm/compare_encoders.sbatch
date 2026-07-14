@@ -37,9 +37,18 @@ module load cuda12.8/toolkit/12.8.1
 source "${HOME}/PlaceDreamer/venv/bin/activate"
 cd "${HOME}/PlaceDreamer"
 
-ENCODERS=(dehnn sage gat dehnn_novn)
+# Explicit index -> variant map. (Do NOT use a bash array indexed by IDX/3: array indexing is
+# 0-based in bash but 1-based in zsh, so the same file silently maps task 0 to an EMPTY encoder
+# under zsh. Correctness must not depend on which shell reads this.)
 IDX=${SLURM_ARRAY_TASK_ID}
-export ENCODER=${ENCODERS[$((IDX / 3))]}
+case $((IDX / 3)) in
+  0) ENCODER=dehnn      ;;   # driver/sink hypergraph conv + VN
+  1) ENCODER=sage       ;;   # GraphSAGE                   + VN
+  2) ENCODER=gat        ;;   # GATv2                       + VN
+  3) ENCODER=dehnn_novn ;;   # driver/sink hypergraph conv, NO VN
+  *) echo "bad array index $IDX (expected 0-11)" >&2; exit 1 ;;
+esac
+export ENCODER
 export FOLD=$((IDX % 3))
 export OUT="runs/cmp_${ENCODER}"
 
