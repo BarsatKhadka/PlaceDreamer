@@ -45,6 +45,7 @@ _META = _NORM = _T2N = None
 # 92% (310,528 params) never received a gradient and only 174 rows are ever used.
 # Fix: a canonical 441-name vocabulary + a remap of the cached ids. Done at LOAD time so no
 # graph re-cache (and no 970MB re-upload) is needed.
+DIRECT_KNOB = bool(int(os.environ.get("DIRECT_KNOB", "1")))  # A/B: raw knobs -> dev head
 N_TYPES = 442            # 441 real cell types + 1 UNK slot (index 441)
 UNK_TYPE = 441
 
@@ -86,9 +87,12 @@ LOG_TARGETS    = ("net_hpwl", "tot_hpwl", "buf_area", "buf_cnt")
 TARGETS        = LOG_TARGETS
 GLOBAL_TARGETS = ("tot_hpwl", "buf_area", "buf_cnt")   # each -> a LEVEL head + a DEVIATION head
 
-def recon(k, lvl, dev, nm):
-    """level + deviation  ->  log(target).  Inverse of the decomposition in set_norm."""
-    return (lvl * float(nm[f"L_{k}_s"]) + float(nm[f"L_{k}_m"])) + dev * float(nm[f"W_{k}"])
+def recon(k, lvl, dev, nm, w=None):
+    """level + deviation -> log(target). Inverse of the decomposition in set_norm.
+    `w` = that design's OWN within-std (g[f"w_{k}"]); falls back to the pooled mean when the
+    design is unknown (e.g. a truly novel design at deploy time)."""
+    if w is None: w = float(nm[f"W_{k}"])
+    return (lvl * float(nm[f"L_{k}_s"]) + float(nm[f"L_{k}_m"])) + dev * float(w)
 
 def _slog(x):
     """signed log1p: sign(x)*log1p(|x|). Handles both signs and crushes the fp_wns tail
@@ -301,9 +305,27 @@ def set_norm(train_designs, force=False):
         tr_d = [d for d in mu_d.index if d in set(train_designs)]
         _NORM[f"L_{k}_m"] = np.float32(mu_d[tr_d].mean())      # M_k  (train designs only)
         _NORM[f"L_{k}_s"] = np.float32(mu_d[tr_d].std() + 1e-6)  # S_k
-        _NORM[f"W_{k}"]   = np.float32(w_d[tr_d].mean() + 1e-6)  # W_k
-        _NORM[f"MU_{k}_keys"] = np.array(mu_d.index)           # per-design level lookup
-        _NORM[f"MU_{k}_vals"] = mu_d.values.astype(np.float32)
+
+        # PER-DESIGN within-std, not a pooled one. Dividing every design's deviation by ONE
+        # pooled W silently weighted the loss by design: per-design within-std varies 6-10x, so
+        # ethernet's buf_cnt deviation target came out at std 1.89 while mem_ctrl's was 0.18 —
+        # and MSE squares that, so ethernet contributed ~100x the deviation gradient. Nobody
+        # chose that. Per-design W => every design's deviation target has std ~1 and every
+        # design contributes equally to the knob-response.
+        _NORM[f"W_{k}_keys"] = np.array(w_d.index)
+        _NORM[f"W_{k}_vals"] = np.maximum(w_d.values, 1e-3).astype(np.float32)
+        _NORM[f"W_{k}"]      = np.float32(w_d[tr_d].mean() + 1e-6)   # kept: used to reconstruct
+
+        # DEGENERATE designs: some chips are so small the resizer inserts the same handful of
+        # buffers no matter what the knobs say. usb_phy has TWO distinct buffer_area values
+        # across all 108 flows; ss_pcm has 3; simple_spi sits at one value in 91 of 108. There
+        # is no knob response to learn OR to score — including them made R2 a division by
+        # ~zero, which is the whole reason buf_area_dev read exactly +0.000.
+        degen = (w_d < 0.03).values                            # <3% log-spread across 108 knobs
+        _NORM[f"DEG_{k}_keys"] = np.array(w_d.index)
+        _NORM[f"DEG_{k}_vals"] = degen
+        _NORM[f"MU_{k}_keys"]  = np.array(mu_d.index)          # per-design level lookup
+        _NORM[f"MU_{k}_vals"]  = mu_d.values.astype(np.float32)
     # floorplan-timing ANCHOR inputs (conditioning, not targets): signed-log + standardize
     for k in ("fp_wns", "fp_tns"):
         v = _slog(mt[k].values.astype(np.float32)); v = v[np.isfinite(v)]
@@ -399,11 +421,15 @@ def load_graph(flow_id, device="cpu"):
                 buf_area=np.log(max(m.buffer_area, 0) + 1.0),
                 buf_cnt =np.log(max(bufcnt, 0) + 1.0) if np.isfinite(bufcnt) else np.nan)
     for k in ("tot_hpwl", "buf_area", "buf_cnt"):
-        keys, vals = nm[f"MU_{k}_keys"], nm[f"MU_{k}_vals"]
-        mu_d = float(vals[np.where(keys == dsg)[0][0]])          # this design's LEVEL
+        i    = int(np.where(nm[f"MU_{k}_keys"] == dsg)[0][0])
+        mu_d = float(nm[f"MU_{k}_vals"][i])                      # this design's LEVEL
+        w_d  = float(nm[f"W_{k}_vals"][i])                       # this design's OWN within-std
+        deg  = bool(nm[f"DEG_{k}_vals"][i])                      # knobs don't move it at all
         yv   = float(raws[k])
         g[f"y_{k}_lvl"] = t((mu_d - float(nm[f"L_{k}_m"])) / float(nm[f"L_{k}_s"]))
-        g[f"y_{k}_dev"] = t((yv - mu_d) / float(nm[f"W_{k}"])) if np.isfinite(yv) else t(0.0)
+        g[f"y_{k}_dev"] = t((yv - mu_d) / w_d) if np.isfinite(yv) else t(0.0)
+        g[f"w_{k}"]     = w_d                                    # to reconstruct absolute
+        g[f"deg_{k}"]   = deg                                    # skip in loss AND metric
         g[f"y_{k}"]     = t(yv)                                  # raw log, for real-unit error
     # per-ENDPOINT slack labels (register endpoints @ place_resized), standardized.
     # y_endpt is per-CELL (0 where no label); m_endpt masks the labeled endpoint cells.
@@ -560,7 +586,27 @@ class FPlace(nn.Module):
         # DEVIATION (the thing f_place exists for). Both targets are O(1), so the knob response
         # finally gets real gradient instead of a +-0.03 wiggle on a unit-variance target.
         self.h_lvl = nn.ModuleDict({k: Linear(256, 2) for k in GLOBAL_TARGETS})
-        self.h_dev = nn.ModuleDict({k: Linear(256, 2) for k in GLOBAL_TARGETS})
+
+        # --- KNOB-DEVIATION HEAD: the knobs go in DIRECTLY, not just via ctx. ---
+        # For ONE design the graph is byte-identical across all 108 flows — only the knobs
+        # change. So of the 320 dims fc1_glob sees, ~256 (h.mean/h.max/hn.mean/hn.max) are
+        # CONSTANT, and the real signal (3 knobs) was buried inside the 64-dim ctx, itself
+        # entangled with 16 design features that are ALSO constant. The head had to learn to
+        # ignore 256 frozen dims and recover a tiny varying subspace — an absurdly indirect way
+        # to express what is nearly a straight line: hpwl ~ a - b*utilization.
+        # Measured: a 3-parameter OLS on the raw knobs scores R2 = +0.68..0.76 within-design.
+        # Our 500k-param model scored -0.18. The task is not hard; we buried the input.
+        # Fix: feed the raw knobs straight to the deviation head. The model can now trivially
+        # represent the linear law, and use the GRAPH to MODULATE it ("this design is more
+        # utilization-sensitive than that one") — which is the part only a GNN can do.
+        # A/B FLAG, not an assumption: DIRECT_KNOB=1 feeds the raw knobs straight to the
+        # deviation head; =0 keeps them only inside ctx. The decomposition fix ALONE already
+        # took the knob response from -14.7 to +0.66, so whether this extra path earns its
+        # place is an open question the RUN should answer, not me.
+        self.direct_knob = DIRECT_KNOB
+        dev_in = 4*d + d + (knob if self.direct_knob else 0)
+        self.fc1_dev = Seq(Linear(dev_in, 256), LeakyReLU(), Linear(256, 256))
+        self.h_dev   = nn.ModuleDict({k: Linear(256, 2) for k in GLOBAL_TARGETS})
         # per-ENDPOINT slack head (per-cell). WNS=min, TNS=sum-neg are READOUTS, not heads.
         # ctx skip so clock_period + the floorplan anchor reach each endpoint's slack directly.
         self.h_endpt = Linear(256, 2)
@@ -606,11 +652,15 @@ class FPlace(nn.Module):
         hc = F.leaky_relu(self.fc1_cell(torch.cat([h, ctx.expand(h.size(0), -1)], 1)))  # per-cell
         hg = F.leaky_relu(self.fc1_glob(torch.cat([
             h.mean(0), h.max(0).values, h_net.mean(0), h_net.max(0).values, ctx])))
+        # deviation head: pooled graph + ctx + THE RAW KNOBS (a direct, unmediated path)
+        dev_in = [h.mean(0), h.max(0).values, h_net.mean(0), h_net.max(0).values, ctx]
+        if self.direct_knob: dev_in.append(g["knobs"])
+        hd = self.fc1_dev(torch.cat(dev_in))
         o = dict(net_hpwl=self.h_net_hpwl(hn),
                  endpt=self.h_endpt(hc))             # per-cell slack; WNS/TNS read out in train
         for k in GLOBAL_TARGETS:                     # level + knob-deviation, both O(1)
-            o[f"{k}_lvl"] = self.h_lvl[k](hg)
-            o[f"{k}_dev"] = self.h_dev[k](hg)
+            o[f"{k}_lvl"] = self.h_lvl[k](hg)        # design level: pooled graph (~n_cells)
+            o[f"{k}_dev"] = self.h_dev[k](hd)        # knob response: knobs go in DIRECTLY
         return o
 
 LOSS   = os.environ.get("LOSS", "decoupled")     # decoupled | beta | nll | mse

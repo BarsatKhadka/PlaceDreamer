@@ -110,8 +110,13 @@ def wloss(out, g, nll=True):
     # it IS the thing f_place exists to predict — the level is ~n_cells and nearly free.
     for k in GLOBAL_TARGETS:
         if k == "buf_cnt" and not g["has_bufcnt"]: continue
-        L = L + W[k]          * gnll(out[f"{k}_lvl"], g[f"y_{k}_lvl"], None, nll)
-        L = L + W["dev"] * W[k] * gnll(out[f"{k}_dev"], g[f"y_{k}_dev"], None, nll)
+        L = L + W[k] * gnll(out[f"{k}_lvl"], g[f"y_{k}_lvl"], None, nll)
+        # skip the DEVIATION term on degenerate designs: some chips are so small the resizer
+        # inserts the same handful of buffers regardless of the knobs (usb_phy has TWO distinct
+        # buffer_area values across all 108 flows). There is no knob response to learn there,
+        # so the term is pure noise.
+        if not g.get(f"deg_{k}", False):
+            L = L + W["dev"] * W[k] * gnll(out[f"{k}_dev"], g[f"y_{k}_dev"], None, nll)
     return L
 
 @torch.no_grad()
@@ -136,10 +141,12 @@ def evaluate(model, flows):
             # reconstruct absolute log(target) = level + deviation; also score the DEVIATION
             # head on its own — that is the knob response, the thing f_place exists for.
             lv, dv = o[f"{k}_lvl"][0].item(), o[f"{k}_dev"][0].item()
-            P[k].append(np.array([recon(k, lv, dv, nm)]))
+            P[k].append(np.array([recon(k, lv, dv, nm, g.get(f"w_{k}"))]))
             T[k].append(np.array([g[f"y_{k}"].item()]))          # raw log
             sig[k].append(np.array([o[f"{k}_dev"][1].item()]))
-            P[k+"_dev"].append(np.array([dv])); T[k+"_dev"].append(np.array([g[f"y_{k}_dev"].item()]))
+            if not g.get(f"deg_{k}", False):     # R2 needs the truth to VARY; skip flat designs
+                P[k+"_dev"].append(np.array([dv]))
+                T[k+"_dev"].append(np.array([g[f"y_{k}_dev"].item()]))
         # WNS/TNS READOUT from per-endpoint slack (denorm to raw slack), vs recorded truth.
         # append every flow (NaN if no endpoints) so wns/tns stay aligned with dz.
         ep = g["ep_idx"]
