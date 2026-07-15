@@ -45,9 +45,15 @@ _META = _NORM = _T2N = None
 # 92% (310,528 params) never received a gradient and only 174 rows are ever used.
 # Fix: a canonical 441-name vocabulary + a remap of the cached ids. Done at LOAD time so no
 # graph re-cache (and no 970MB re-upload) is needed.
-DIRECT_KNOB = bool(int(os.environ.get("DIRECT_KNOB", "1")))  # A/B: raw knobs -> dev head
+DIRECT_KNOB = bool(int(os.environ.get("DIRECT_KNOB") or "1"))  # A/B: raw knobs -> dev head
 AGGR = os.environ.get("AGGR", "mean")   # A/B: sum | mean | multi | gcn  — see HyperConv
 FUSE = os.environ.get("FUSE", "concat") # A/B: how the cell encoder fuses its 3 sources
+VN_KNOBS = bool(int(os.environ.get("VN_KNOBS") or "1"))  # A/B: do the knobs ride into the VN?
+# The dehnn_novn sweep win likely means knobs-through-VN DILUTES them (LOSTIN warns of
+# exactly this: a knob supernode -> 40.7%% MAPE, late-concat -> 3.11%%). VN_KNOBS=0 keeps
+# the VN doing its STRUCTURAL job (long-range pooling) but stops routing knobs through it
+# — the knobs still reach every head via the direct ctx skip. Tests: is it the VN that
+# hurts, or just the knob DELIVERY through it?
 # NOTE: DE-HNN uses NEITHER sum NOR mean. They use gcn_norm-weighted sum
 # (train_all_cross.py:85-87): each edge weighted 1/sqrt(deg_i*deg_j). AGGR=gcn is that.
 N_TYPES = 442            # 441 real cell types + 1 UNK slot (index 441)
@@ -604,6 +610,7 @@ class FPlace(nn.Module):
         assert encoder in ENCODERS, f"unknown encoder {encoder}; pick from {ENCODERS}"
         self.encoder = encoder
         self.use_vn = encoder != "dehnn_novn"     # the no-VN ablation
+        self.vn_knobs = VN_KNOBS                  # do knobs ride into the VN? (A/B)
         self.K = K
         # SIGN-INVARIANT PE (SignNet, Lim et al. 2023). Laplacian eigenvectors have an
         # ARBITRARY SIGN: across eigsh reruns 4-8 of our 10 dims flip, so the same structural
@@ -715,7 +722,8 @@ class FPlace(nn.Module):
             # Pool the SIGN-INVARIANT `feat`, not raw cell_x (raw PE would leak the sign in).
             vn_in = torch.cat([scatter(feat, part, 0, dim_size=nvn, reduce="mean"),
                                scatter(feat, part, 0, dim_size=nvn, reduce="max")], 1)
-            vn = self.virtualnode_encoder(vn_in) + ctx
+            # knobs ride into the VN only if VN_KNOBS; otherwise VN carries STRUCTURE only
+            vn = self.virtualnode_encoder(vn_in) + (ctx if self.vn_knobs else 0)
         else:
             h, h_net = h + ctx, h_net + ctx        # no VN → ctx can only be added at input
         ntn, ttype, ntc = g["ntn"], g["ntn_type"], g["ntc"]
