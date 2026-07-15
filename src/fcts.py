@@ -112,23 +112,30 @@ class FCTS(nn.Module):
         # cell_in - n_pe = CELL_IN_CTS - 10 = 14 inputs, which matches.
         self.enc.pe_start = fplace.PE_SLICE.start + 2
         self.d = d
-        # SINK readout: pool cell embeddings over CLOCK SINKS only (mean + max) + ctx.
-        # mean -> buffer count / power (sum-like); max -> worst-case sink for skew/WNS.
-        self.fc_sink = Seq(Linear(2*d + d, 256), LeakyReLU(), Linear(256, 256))
+        # TWO readouts, because CTS targets have different SCOPE:
+        #   sink-pool  (clock sinks only, mean+max)  -> cts_buffers (a clock-tree quantity)
+        #   whole-pool (all cells + all nets)        -> cts_power, cts_wns, cts_tns
+        # Bug found on the first run: pooling total_power over only the ~5% clock-sink cells
+        # threw away the design-wide switching info -> power knob-R2 went NEGATIVE while its OLS
+        # ceiling is +0.96. total_power is a WHOLE-design quantity; only buffers are sink-scoped.
+        self.fc_sink  = Seq(Linear(2*d + d, 256), LeakyReLU(), Linear(256, 256))   # sinks + ctx
+        self.fc_whole = Seq(Linear(4*d + d, 256), LeakyReLU(), Linear(256, 256))   # cells,nets + ctx
+        self.scope = {"cts_buffers": "sink", "cts_power": "whole",
+                      "cts_wns": "whole", "cts_tns": "whole"}
         self.h_lvl = nn.ModuleDict({k: Linear(256, 2) for k in CTS_GLOBAL + CTS_TIMING})
         self.h_dev = nn.ModuleDict({k: Linear(256, 2) for k in CTS_GLOBAL + CTS_TIMING})
 
     def forward(self, g):
         h, h_net, ctx = self.enc.encode(g)          # SAME winning encoder as f_place
         sm = g["sink_mask"]
-        if sm.sum() < 1:                            # no sinks (shouldn't happen) -> whole-graph pool
-            sink = torch.cat([h.mean(0), h.max(0).values, ctx])
-        else:
-            hs = h[sm]
-            sink = torch.cat([hs.mean(0), hs.max(0).values, ctx])
-        z = F.leaky_relu(self.fc_sink(sink))
+        hs = h[sm] if sm.sum() >= 1 else h
+        z_sink  = F.leaky_relu(self.fc_sink(torch.cat([hs.mean(0), hs.max(0).values, ctx])))
+        z_whole = F.leaky_relu(self.fc_whole(torch.cat([
+            h.mean(0), h.max(0).values, h_net.mean(0), h_net.max(0).values, ctx])))
+        z = {"sink": z_sink, "whole": z_whole}
         o = {}
         for k in CTS_GLOBAL + CTS_TIMING:
-            o[f"{k}_lvl"] = self.h_lvl[k](z)
-            o[f"{k}_dev"] = self.h_dev[k](z)
+            zk = z[self.scope[k]]
+            o[f"{k}_lvl"] = self.h_lvl[k](zk)
+            o[f"{k}_dev"] = self.h_dev[k](zk)
         return o
