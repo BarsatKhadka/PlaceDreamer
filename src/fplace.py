@@ -620,6 +620,7 @@ class FPlace(nn.Module):
         # permutes the two terms and leaves the sum identical.
         # Applied per-eigenvector (each of the 10 dims is independently sign-ambiguous).
         self.n_pe = PE_SLICE.stop - PE_SLICE.start                       # 10
+        self.pe_start = PE_SLICE.start   # where the PE block begins in cell_x (f_cts shifts this)
         self.pe_phi = Seq(Linear(1, 32), LeakyReLU(), Linear(32, 32))    # phi: per-eigvec
         self.pe_rho = Seq(Linear(32 * self.n_pe, d), LeakyReLU(), Linear(d, d))   # rho: combine
         self.node_encoder = Seq(Linear(cell_in - self.n_pe, d), LeakyReLU(), Linear(d, d))
@@ -705,34 +706,33 @@ class FPlace(nn.Module):
         s = self.pe_phi(v) + self.pe_phi(-v)                  # (C, n_pe, 32)  <- sign-invariant
         return self.pe_rho(s.flatten(1))                      # (C, d)
 
-    def forward(self, g):
-        # split raw cell features: library dims | Laplacian PE (sign-ambiguous -> SignNet)
-        lib, pe = g["cell_x"][:, :PE_SLICE.start], g["cell_x"][:, PE_SLICE]
+    def encode(self, g):
+        """The shared graph encoder: raw features -> (cell embeddings h, net embeddings h_net,
+        design/knob context ctx). Everything up to the readout heads. f_cts reuses this EXACT
+        encoder (winning config: DE-HNN + VN-structure + multi-aggr + concat-fuse), so the seam
+        can feed one stage's imagined state into the next through the same representation."""
+        lib = g["cell_x"][:, :self.pe_start]
+        pe  = g["cell_x"][:, self.pe_start:self.pe_start + self.n_pe]
         e_lib, e_typ, e_pe = self.node_encoder(lib), self.type_emb(g["cell_type"]), self.encode_pe(pe)
         feat  = torch.cat([lib, e_pe], 1)                     # sign-INVARIANT cell features (for VN)
-        # CONCAT-then-fuse (default) keeps library / type / structure in separate subspaces;
-        # SUM superimposes all three in the same 64 dims. See the note in __init__.
         h = (self.fuse_mlp(torch.cat([e_lib, e_typ, e_pe], 1)) if self.fuse == "concat"
              else e_lib + e_typ + e_pe)
         h_net = self.net_encoder(g["net_x"])
         part, nvn = g["part_cell"], g["num_vn"]
         ctx = self.ctx(torch.cat([g["knobs"], g["dfeat"]]))
         if self.use_vn:
-            # VN init: DE-HNN pooled input feats + OUR knob/design ctx (→ broadcast every layer).
-            # Pool the SIGN-INVARIANT `feat`, not raw cell_x (raw PE would leak the sign in).
             vn_in = torch.cat([scatter(feat, part, 0, dim_size=nvn, reduce="mean"),
                                scatter(feat, part, 0, dim_size=nvn, reduce="max")], 1)
-            # knobs ride into the VN only if VN_KNOBS; otherwise VN carries STRUCTURE only
             vn = self.virtualnode_encoder(vn_in) + (ctx if self.vn_knobs else 0)
         else:
-            h, h_net = h + ctx, h_net + ctx        # no VN → ctx can only be added at input
+            h, h_net = h + ctx, h_net + ctx
         ntn, ttype, ntc = g["ntn"], g["ntn_type"], g["ntc"]
-        if self.training:                                     # DE-HNN edge dropout p=0.2
+        if self.training:
             ntn, mask = dropout_edge(ntn, p=0.2)
             ttype, ntc = ttype[mask], ntc[:, mask]
         for l in range(self.K):
             if self.use_vn:
-                h = self.back_vn[l](torch.cat([h, vn[part]], 1)) + h   # VN → cells (carries knobs)
+                h = self.back_vn[l](torch.cat([h, vn[part]], 1)) + h
             h, h_net = self.convs[l](h, h_net, ntn, ttype, ntc)
             h     = F.leaky_relu(self.norms[l](h))
             h_net = F.leaky_relu(self.norms[l](h_net))
@@ -740,6 +740,10 @@ class FPlace(nn.Module):
                 vn_t = torch.cat([scatter(h, part, 0, dim_size=nvn, reduce="mean"),
                                   scatter(h, part, 0, dim_size=nvn, reduce="max")], 1)
                 vn = self.mlp_vn[l](vn_t) + vn
+        return h, h_net, ctx
+
+    def forward(self, g):
+        h, h_net, ctx = self.encode(g)
         hn = F.leaky_relu(self.fc1_net(torch.cat([h_net, ctx.expand(h_net.size(0), -1)], 1)))
         hc = F.leaky_relu(self.fc1_cell(torch.cat([h, ctx.expand(h.size(0), -1)], 1)))  # per-cell
         hg = F.leaky_relu(self.fc1_glob(torch.cat([
