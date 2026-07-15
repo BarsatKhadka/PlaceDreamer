@@ -83,15 +83,11 @@ for v in sorted(by_variant):
         row.append(f"{m:.2f} {u}" if n else "—")
     L.append("| " + " | ".join(row) + " |")
 
-L.append("\n## Test designs per fold\n")
-seen = set()
-for v in sorted(by_variant):
-    for f in by_variant[v]:
-        t = (f["fold"], tuple(f["test_designs"]))
-        if t not in seen:
-            seen.add(t)
-            L.append(f"- fold {f['fold']}: {', '.join(f['test_designs'])}")
-    break
+L.append("\n## Test designs per fold  (from the MOST RECENT run — folds changed to size-stratified)\n")
+# pick the newest results file so the fold layout matches the current code, not a stale run
+newest = max(runs, key=os.path.getmtime)
+for f in sorted(json.load(open(newest)), key=lambda x: x["fold"]):
+    L.append(f"- fold {f['fold']}: {', '.join(f['test_designs'])}")
 
 out = "\n".join(L) + "\n"
 open(f"{ROOT}/RESULTS.md", "w").write(out)
