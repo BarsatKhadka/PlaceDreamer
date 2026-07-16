@@ -40,7 +40,10 @@ def seam_dims():
     return dict(cell=(1 if on else 0), net=(1 if on else 0),
                 df=(2 * len(seam.PLACE_GLOBAL) if on else 0))
 
-KNOB = 5                                      # raw knob vector width (matches fplace)
+KNOB = 6                                      # raw knob vector width (matches fplace):
+# clock_period, utilization, aspect_ratio, fp_wns, fp_tns, crit_path(=period-fp_wns).
+# crit_path is theta(G_D), the design's TIMING SCALE — measured to lift the achievable
+# knob-response ceiling cts_power 0.143->0.419 and cts_wns 0.121->0.372 (held-out).
 # A/B FLAG, not an assumption: do the RAW knobs get a direct path into the deviation heads?
 # f_place has exactly this (fplace.DIRECT_KNOB, default on, A/B-validated). f_cts never did —
 # its knobs only reached the dev heads through ctx = MLP([knobs, dfeat]), mixed with 16 design

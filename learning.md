@@ -570,6 +570,52 @@ LOSTIN note (knob supernode 40.7% MAPE vs late-concat 3.11%).
 
 ---
 
+## 4g. ⚠️ RETRACTION #3 — the CTS "ceilings" cheated too, and f_cts was never failing
+
+Same bug as §4e: I quoted CTS ceilings computed from `dev(clock_period)`, the within-design-
+centered knob, which secretly hands the model the design's mean clock period. **HONEST ceilings**
+(train 7 designs → held-out designs, raw knobs only):
+
+| target | **RAW-knob (legit)** | dev-knob (cheats) | f_cts actual |
+|---|---|---|---|
+| cts_buffers | **0.043** | 0.043 | **+0.301** ✅ **7× the baseline** |
+| cts_power | **0.143** | 0.970 | **+0.138** — *already AT the ceiling* |
+| cts_wns | **0.121** | 0.869 | **+0.145** ✅ |
+| cts_tns | 0.105 | 0.759 | — |
+
+**f_cts was never failing.** It is at or above the honest baseline on every target and crushes it
+on buffers. My "power only moves +0.030 against a 0.905 ceiling — an open gap" was pure artifact.
+The whole "f_cts scores ~0, something is broken" narrative was wrong; only the *direct-knob*
+finding survives (and it is what got buffers from −0.204 to +0.301).
+
+### ✅ But the raw-vs-dev SPREAD is the real opportunity — and it confirms the interaction theory
+power 0.143 → 0.970 *once you know the design's mean clock period*. That is not a fantasy: EDA-
+Schema scales each design's clock to its own critical path, so it is a **physical** quantity, and
+the floorplan anchor gives us a proxy.
+
+**MEASURED — `crit_path = clock_period − fp_wns` (floorplan ⇒ pre-placement ⇒ leak-free):**
+
+| target | raw knobs | **+crit_path** | +tightness | dev (oracle) |
+|---|---|---|---|---|
+| cts_power | 0.143 | **0.419** | 0.419 | 0.970 |
+| cts_wns | 0.121 | **0.372** | 0.372 | 0.869 |
+| cts_buffers | 0.043 | 0.043 | 0.043 | 0.043 |
+
+**~3× on the timing targets**, and correctly **nothing** on buffers (not timing-driven) — a good
+sign the feature is doing physics, not fitting noise. It recovers ~43% of the gap to the oracle.
+`corr(log crit_path, log mean_design(clock_period)) = 0.743` — partial recovery, hence not the
+full 0.970. "Tightness" `log(cp/crit)` adds nothing because it is linearly redundant once both
+`log cp` and `log crit` are present, exactly as it should be.
+
+**This is `y_dev = f(k ; θ(G_D))` made concrete**: a knob only means something relative to the
+design's own scale (`clock_period = 3ns` is tight for des3_area, loose for ac97). Supply θ and the
+ceiling triples. Added to the **KNOB vector** (width 5 → 6), NOT dfeat — the deviation head reads
+raw knobs directly, while dfeat only arrives smeared through `ctx` and K message-passing layers.
+Fed explicitly rather than derived, per Δ-ML (give the prior's derivation inputs: 81.88% → 99.15%).
+f_cts inherits it free, since it reuses f_place's `load_graph`.
+
+---
+
 ## 5. Open questions / decisions needed
 
 1. **HYPOTHESIS (under test)**: f_cts's dev heads had **no direct knob path** — knobs reached

@@ -57,7 +57,7 @@ VN_KNOBS = bool(int(os.environ.get("VN_KNOBS") or "1"))  # A/B: do the knobs rid
 # NOTE: DE-HNN uses NEITHER sum NOR mean. They use gcn_norm-weighted sum
 # (train_all_cross.py:85-87): each edge weighted 1/sqrt(deg_i*deg_j). AGGR=gcn is that.
 # bump when set_norm's CONTENT changes (new keys/stats) so stale caches invalidate
-NORM_VERSION = 3   # +geometry feats, +wns_g/tns_g global targets
+NORM_VERSION = 4   # +geometry feats, +wns_g/tns_g targets, +crit_path knob
 N_TYPES = 442            # 441 real cell types + 1 UNK slot (index 441)
 UNK_TYPE = 441
 
@@ -462,6 +462,11 @@ def set_norm(train_designs, force=False):
     for k in ("clock_period", "utilization", "aspect_ratio"):
         v = mt[k].values.astype(np.float32)
         _NORM[f"k_{k}_m"] = np.float32(v.mean()); _NORM[f"k_{k}_s"] = np.float32(v.std() + 1e-6)
+    # design TIMING SCALE stats (train designs only) — crit_path = clock_period - fp_wns.
+    cv = np.log(np.maximum(mt["clock_period"].values.astype(np.float64)
+                           - mt["fp_wns"].values.astype(np.float64), 1e-3))
+    cv = cv[np.isfinite(cv)]
+    _NORM["k_crit_m"] = np.float32(cv.mean()); _NORM["k_crit_s"] = np.float32(cv.std() + 1e-6)
     np.savez(f, **_NORM)
     print(f"[norm] built from {len(train_designs)} TRAIN designs → {os.path.basename(f)}")
     for k in TARGETS:
@@ -528,8 +533,25 @@ def load_graph(flow_id, device="cpu"):
     a_wns = (_slog(float(m.fp_wns)) - nm["a_fp_wns_m"]) / nm["a_fp_wns_s"]
     a_tns = (_slog(float(m.fp_tns)) - nm["a_fp_tns_m"]) / nm["a_fp_tns_s"]
     kz = lambda k: (float(m[k]) - float(nm[f"k_{k}_m"])) / float(nm[f"k_{k}_s"])
+    # DESIGN TIMING SCALE — theta(G_D) made explicit. THE point: a knob is only meaningful
+    # RELATIVE to the design's own scale. clock_period is design-specific (each design's clock is
+    # set from its critical path: ac97 1.8-3.0ns, des3_area 6.0-9.3ns), so "3ns" is tight for one
+    # and loose for another. The knob response is an INTERACTION y_dev = f(k ; theta(G_D)), and
+    # without theta the model cannot decode the knob at all.
+    # crit_path ~= clock_period - fp_wns  (floorplan timing => PRE-placement => leak-free).
+    # MEASURED (raw knobs -> +crit_path, held-out designs, within-design knob response):
+    #     cts_power  0.143 -> 0.419      cts_wns  0.121 -> 0.372      cts_buffers 0.043 -> 0.043
+    # i.e. ~3x on the timing targets, and correctly NOTHING on buffers (not timing-driven).
+    # It recovers ~43% of the gap to an oracle that is handed mean_design(clock_period) (0.970).
+    # Goes in the KNOB vector, NOT dfeat: the deviation head reads the raw knobs DIRECTLY
+    # (DIRECT_KNOB), while dfeat only reaches it smeared through ctx and K message-passing layers.
+    # Fed explicitly rather than left to be derived: it is a subtraction of two differently
+    # transformed, z-scored quantities (Delta-ML — give the model the prior's derivation inputs,
+    # not just the prior: R2 81.88% -> 99.15%).
+    crit = max(float(m.clock_period) - float(m.fp_wns), 1e-3)
+    a_crit = (np.log(crit) - nm["k_crit_m"]) / nm["k_crit_s"]
     knb = np.array([kz("clock_period"), kz("utilization"), kz("aspect_ratio"),
-                    a_wns, a_tns], np.float32)     # all 5 now unit-variance, zero-mean
+                    a_wns, a_tns, a_crit], np.float32)   # all 6 unit-variance, zero-mean
     # VN partition, compacted to the surviving cells. Re-densify the partition ids: dropping
     # tapcells can empty a partition, and scatter(dim_size=max+1) would leave a hole.
     pc = np.asarray(d["part_cell"])[keep]
@@ -737,7 +759,7 @@ class BipartiteConv(nn.Module):
 ENCODERS = {"dehnn", "dehnn_novn", "dehnn_undirected", "sage", "gat"}
 
 class FPlace(nn.Module):
-    def __init__(self, d=64, K=4, cell_in=CELL_IN, net_in=NET_IN, knob=5, dfeat=DF_IN, encoder="dehnn"):
+    def __init__(self, d=64, K=4, cell_in=CELL_IN, net_in=NET_IN, knob=6, dfeat=DF_IN, encoder="dehnn"):
         super().__init__()
         assert encoder in ENCODERS, f"unknown encoder {encoder}; pick from {ENCODERS}"
         self.encoder = encoder
