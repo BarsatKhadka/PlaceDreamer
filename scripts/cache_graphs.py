@@ -15,8 +15,9 @@ import os, sys, json, time, numpy as np, pandas as pd
 import pyarrow.dataset as ds
 sys.path.insert(0, os.path.dirname(__file__))
 from build_graph import build, load_cell_lib, DATA
+ROOT = os.environ.get("PD_ROOT", os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-OUT = "/Users/barsat/PlaceDreamer/cache"
+OUT = f"{ROOT}/cache"
 GDIR = f"{OUT}/graphs"; os.makedirs(GDIR, exist_ok=True)
 IN_STAGE = "floorplan"        # f_place input netlist
 LABEL_STAGE = "global_place"  # placement outcome

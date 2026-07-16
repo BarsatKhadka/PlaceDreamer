@@ -22,8 +22,10 @@ import pyarrow.parquet as pq
 import scipy.sparse as sp
 from scipy.sparse.linalg import eigsh
 import pymetis
+import os
+ROOT = os.environ.get("PD_ROOT", os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-DATA = "/Users/barsat/PlaceDreamer/datasets/sky130hd"
+DATA = f"{ROOT}/datasets/sky130hd"
 
 # --- standard-cell library: name -> numeric features + type id (loaded once) ---
 def load_cell_lib():

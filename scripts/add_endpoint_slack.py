@@ -18,9 +18,11 @@ ranges 9–100%). So these direct labels teach the SHAPE; the complete recorded 
 (cache/meta.parquet) constrain the aggregate. Labels join by cell_names — NO graph rebuild.
 """
 import pyarrow.dataset as ds, numpy as np, glob, os, sys
-DATA  = "/Users/barsat/PlaceDreamer/datasets/sky130hd"
-CACHE = "/Users/barsat/PlaceDreamer/cache/graphs"
-OUT   = "/Users/barsat/PlaceDreamer/cache/endpt"
+import os
+ROOT = os.environ.get("PD_ROOT", os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+DATA  = f"{ROOT}/datasets/sky130hd"
+CACHE = f"{ROOT}/cache/graphs"
+OUT   = f"{ROOT}/cache/endpt"
 STAGE = "place_resized"
 os.makedirs(OUT, exist_ok=True)
 

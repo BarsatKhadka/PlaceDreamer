@@ -26,9 +26,12 @@ matching how cache/cts is consumed.
 """
 import pyarrow.dataset as ds, numpy as np, pandas as pd, glob, os
 
-DATA  = "/Users/barsat/PlaceDreamer/datasets/sky130hd"
-CACHE = "/Users/barsat/PlaceDreamer/cache/graphs"
-OUT   = "/Users/barsat/PlaceDreamer/cache/coords"
+# derive the repo root from THIS file (same rule as fplace.py) — never hardcode an absolute
+# path: the repo is ~/PlaceDreamer on a laptop but /ddnlus/<user>/PlaceDreamer on the cluster.
+ROOT  = os.environ.get("PD_ROOT", os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+DATA  = f"{ROOT}/datasets/sky130hd"
+CACHE = f"{ROOT}/cache/graphs"
+OUT   = f"{ROOT}/cache/coords"
 STAGE = "place_resized"          # f_place's target stage — same one add_endpoint_slack uses
 os.makedirs(OUT, exist_ok=True)
 

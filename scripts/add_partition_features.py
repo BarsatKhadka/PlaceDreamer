@@ -34,7 +34,7 @@ computed ONCE per design and shared by all 108 flows. No graph rebuild.
 import numpy as np, glob, os, sys
 import pymetis
 
-ROOT  = "/Users/barsat/PlaceDreamer"
+ROOT  = os.environ.get("PD_ROOT", os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 CACHE = f"{ROOT}/cache/graphs"
 OUT   = f"{ROOT}/cache/part"
 GRANS = (100, 200, 300, 500, 1000, 2000, 3000)     # Net2's 7 cell granularities

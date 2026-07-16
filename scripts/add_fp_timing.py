@@ -12,8 +12,10 @@ floorplan WNS -84 vs place_resized -3). The model learns the nonlinear mapping.
 Per-flow scalars -> meta only, NO graph rebuild, NO re-cache.
 """
 import pandas as pd, pyarrow.dataset as ds, numpy as np
-DATA  = "/Users/barsat/PlaceDreamer/datasets/sky130hd"
-META  = "/Users/barsat/PlaceDreamer/cache/meta.parquet"
+import os
+ROOT = os.environ.get("PD_ROOT", os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+DATA  = f"{ROOT}/datasets/sky130hd"
+META  = f"{ROOT}/cache/meta.parquet"
 STAGE = "floorplan"
 
 m = pd.read_parquet(META)

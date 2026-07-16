@@ -10,7 +10,7 @@ Aligned to f_place's FLOORPLAN net order by name (nets that survive to detailed_
 split during buffering/CTS won't match — masked, same handling as f_place's net_hpwl.
 """
 import pyarrow.dataset as ds, numpy as np, glob, os
-ROOT="/Users/barsat/PlaceDreamer"; DATA=f"{ROOT}/datasets/sky130hd"; CACHE=f"{ROOT}/cache/graphs"
+ROOT=os.environ.get("PD_ROOT", os.path.dirname(os.path.dirname(os.path.abspath(__file__)))); DATA=f"{ROOT}/datasets/sky130hd"; CACHE=f"{ROOT}/cache/graphs"
 OUT=f"{ROOT}/cache/route"; os.makedirs(OUT, exist_ok=True)
 nets_ds=ds.dataset(f"{DATA}/nets/table.parquet")
 

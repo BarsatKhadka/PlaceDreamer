@@ -10,7 +10,7 @@ Run ONCE locally (needs datasets/). The .npz is committed, so the cluster (which
 but not the 71GB datasets/) just gets it from git. No graph re-cache needed.
 """
 import pyarrow.parquet as pq, numpy as np, glob, os
-ROOT = "/Users/barsat/PlaceDreamer"
+ROOT = os.environ.get("PD_ROOT", os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 names = pq.read_table(f"{ROOT}/datasets/sky130hd/standard_cells/table.parquet",
                       columns=["name"]).to_pydict()["name"]

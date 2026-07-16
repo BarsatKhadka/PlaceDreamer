@@ -12,7 +12,7 @@ It needs three things f_place didn't:
    cells are 2-3.4x closer in the real placement. See docs/architecture.md.)
 """
 import pyarrow.dataset as ds, numpy as np, glob, os
-ROOT="/Users/barsat/PlaceDreamer"; DATA=f"{ROOT}/datasets/sky130hd"; CACHE=f"{ROOT}/cache/graphs"
+ROOT=os.environ.get("PD_ROOT", os.path.dirname(os.path.dirname(os.path.abspath(__file__)))); DATA=f"{ROOT}/datasets/sky130hd"; CACHE=f"{ROOT}/cache/graphs"
 OUT=f"{ROOT}/cache/cts"; os.makedirs(OUT, exist_ok=True)
 
 # PER FLOW — the netlist is re-synthesized per knob config, so a design's flows have DIFFERENT

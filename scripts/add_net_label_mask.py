@@ -18,7 +18,7 @@ Detection: a net is UNTRUSTWORTHY if its fanout changed floorplan -> global_plac
 Per-flow scalars/arrays only — NO graph rebuild.
 """
 import pyarrow.dataset as ds, numpy as np, glob, os
-ROOT  = "/Users/barsat/PlaceDreamer"
+ROOT  = os.environ.get("PD_ROOT", os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 DATA  = f"{ROOT}/datasets/sky130hd"
 CACHE = f"{ROOT}/cache/graphs"
 OUT   = f"{ROOT}/cache/netmask"

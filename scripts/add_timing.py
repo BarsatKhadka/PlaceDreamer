@@ -7,8 +7,10 @@ with the knobs (aes_core: WNS ranges -4.22 .. -0.13 across its 108 configs). f_p
 to predict them for its picture of the placement state to be complete.
 """
 import pandas as pd, pyarrow.dataset as ds, numpy as np
-DATA  = "/Users/barsat/PlaceDreamer/datasets/sky130hd"
-META  = "/Users/barsat/PlaceDreamer/cache/meta.parquet"
+import os
+ROOT = os.environ.get("PD_ROOT", os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+DATA  = f"{ROOT}/datasets/sky130hd"
+META  = f"{ROOT}/cache/meta.parquet"
 STAGE = "place_resized"          # same stage as buffer_area / buffer_count
 
 m = pd.read_parquet(META)

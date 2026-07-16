@@ -28,7 +28,7 @@ shared by all 108 flows. No graph rebuild.
 """
 import numpy as np, glob, os
 
-ROOT  = "/Users/barsat/PlaceDreamer"
+ROOT  = os.environ.get("PD_ROOT", os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 CACHE = f"{ROOT}/cache/graphs"
 OUT   = f"{ROOT}/cache/elec"
 os.makedirs(OUT, exist_ok=True)
