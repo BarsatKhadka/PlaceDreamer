@@ -63,6 +63,7 @@ W = dict(net_hpwl=float(E("W_NETHPWL", 5)),        # dense: ~10k nets/flow
          tot_hpwl=float(E("W_TOT", 1)), buf_area=float(E("W_BUFA", 1)),
          buf_cnt=float(E("W_BUFC", 1)),
          pos=float(E("W_POS", 5)),                 # dense: EVERY cell — placement GEOMETRY
+         vnbox=float(E("W_VNBOX", 5)),             # per-METIS-cluster bbox — the POSED geometry
          dev=float(E("W_DEV", 3)))                 # knob-DEVIATION weight (the thing we want)
 torch.manual_seed(SEED); random.seed(SEED); np.random.seed(SEED)
 os.makedirs(OUT, exist_ok=True)
@@ -135,6 +136,10 @@ def wloss(out, g, nll=True):
     if "y_pos_x" in g:
         L = L + W["pos"] * (gnll(out["pos_x"], g["y_pos_x"], g["m_pos"], nll)
                           + gnll(out["pos_y"], g["y_pos_y"], g["m_pos"], nll))
+    # per-VN bounding box (xmin,ymin,xmax,ymax) — the well-posed geometry target.
+    if "y_vnbox" in g and g["m_vnbox"].any():
+        for i in range(4):
+            L = L + W["vnbox"] * gnll(out["vn_box"][:, i], g["y_vnbox"][:, i], g["m_vnbox"], nll)
     # global targets: LEVEL + knob DEVIATION, both O(1). The deviation is up-weighted because
     # it IS the thing f_place exists to predict — the level is ~n_cells and nearly free.
     for k in GLOBAL_TARGETS:

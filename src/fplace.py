@@ -501,9 +501,27 @@ def load_graph(flow_id, device="cpu"):
     # canonical frame. mask is False only for cells with no coordinate (tapcells -> dropped by
     # keep anyway), so coverage on the kept cells is ~100%.
     pc_ = np.load(f"{ROOT}/cache/coords/{flow_id}.npz")
-    g["y_pos_x"] = t(pc_["x"][keep].astype(np.float32))
-    g["y_pos_y"] = t(pc_["y"][keep].astype(np.float32))
-    g["m_pos"]   = t(pc_["mask"][keep], torch.bool)
+    cxn, cyn, cmk = pc_["x"][keep], pc_["y"][keep], pc_["mask"][keep]
+    g["y_pos_x"] = t(cxn.astype(np.float32))
+    g["y_pos_y"] = t(cyn.astype(np.float32))
+    g["m_pos"]   = t(cmk, torch.bool)
+    # per-VIRTUAL-NODE BOUNDING BOX — the geometry target that is actually well-posed.
+    # Predicting all ~20k cell positions is under-determined cross-design (a short run converged
+    # straight to the predict-die-centre baseline). But a VN is a METIS CONNECTIVITY cluster, and
+    # the placer keeps connected cells together — measured, a cluster occupies a median 1.4%
+    # (jpeg) to 21% (ac97) of the die, NOT the whole die. So a cluster's box is a real region:
+    #   ~110 cells averaged per target -> per-cell placement noise cancels
+    #   ~40-350 targets/flow instead of 20,000 -> vastly better conditioned
+    #   the box carries LOCATION (where the cluster sits) AND SPREAD (its extent) — and spread
+    #   is what sets clock wirelength, which is what f_cts needs from the seam.
+    nvn = int(g["num_vn"])
+    box = np.zeros((nvn, 4), np.float32); mvn = np.zeros(nvn, bool)
+    for p in range(nvn):
+        s = (pc == p) & cmk
+        if s.sum() < 5: continue                      # too few cells -> box is noise, mask it out
+        box[p] = (cxn[s].min(), cyn[s].min(), cxn[s].max(), cyn[s].max())
+        mvn[p] = True
+    g["y_vnbox"] = t(box); g["m_vnbox"] = t(mvn, torch.bool)   # [nvn,4] = xmin,ymin,xmax,ymax
     # raw recorded WNS/TNS — for eval readout comparison (complete, untruncated)
     g["wns_true"] = float(m.wns); g["tns_true"] = float(m.tns)
     return {k: (v.to(device) if torch.is_tensor(v) else v) for k, v in g.items()}
@@ -718,6 +736,9 @@ class FPlace(nn.Module):
         # layout (sasc corr y 0.92 -> 0.13 as the die goes AR 2.08 -> 0.68) -- so geometry
         # CARRIES the knob response the summary globals were crushing 18-53x.
         self.h_pos = Linear(256, 4)                 # [mu_x, logvar_x, mu_y, logvar_y]
+        # per-VN BOUNDING BOX head: pool the VN's cells (mean+max) -> xmin,ymin,xmax,ymax,
+        # each (mu, logvar). Coarser and far better-posed than per-cell position — see load_graph.
+        self.h_vnbox = Seq(Linear(2 * 256, 256), LeakyReLU(), Linear(256, 8))
 
     def encode_pe(self, pe):
         """SignNet: rho( concat_i [ phi(v_i) + phi(-v_i) ] ). Invariant to v_i -> -v_i by
@@ -773,9 +794,13 @@ class FPlace(nn.Module):
         if self.direct_knob: dev_in.append(g["knobs"])
         hd = self.fc1_dev(torch.cat(dev_in))
         p = self.h_pos(hc)                           # per-cell normalized (x, y) geometry
+        # VN boxes: pool each METIS cluster's cell embeddings, then read its bbox off that.
+        vb = torch.cat([scatter(hc, g["part_cell"], 0, dim_size=g["num_vn"], reduce="mean"),
+                        scatter(hc, g["part_cell"], 0, dim_size=g["num_vn"], reduce="max")], 1)
         o = dict(net_hpwl=self.h_net_hpwl(hn),
                  endpt=self.h_endpt(hc),             # per-cell slack; WNS/TNS read out in train
-                 pos_x=p[:, 0:2], pos_y=p[:, 2:4])   # each (mu, logvar) -> gnll like every head
+                 pos_x=p[:, 0:2], pos_y=p[:, 2:4],   # each (mu, logvar) -> gnll like every head
+                 vn_box=self.h_vnbox(vb).view(-1, 4, 2))    # [nvn, 4 coords, (mu, logvar)]
         for k in GLOBAL_TARGETS:                     # level + knob-deviation, both O(1)
             o[f"{k}_lvl"] = self.h_lvl[k](hg)        # design level: pooled graph (~n_cells)
             o[f"{k}_dev"] = self.h_dev[k](hd)        # knob response: knobs go in DIRECTLY
