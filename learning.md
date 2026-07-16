@@ -355,36 +355,70 @@ re-synthesize the netlist.
 
 So: **G_D does not depend on k.**
 
-### The consequences are not opinions, they are implications
+### ⚠️ CORRECTION TO MY OWN FIRST DRAFT OF THIS SECTION
+I first wrote that "the GNN adds nothing to knob response; OLS on 3 knobs beats it on 4/5
+targets." **That was wrong, and it was wrong because MY BASELINE CHEATED.**
 
-Write the model as `y(D,k) = F(G_D, k)`. Since `G_D ⟂ k`:
+`clock_period` is **DESIGN-SPECIFIC** (each design's clock is scaled to its own critical path):
+ac97 1.8–3.0, aes_core 3.6–5.7, des3_area 6.0–9.3; per-design mean spread **2.017**. But
+`utilization` and `aspect_ratio` use an **identical grid for every design** (per-design mean
+spread **0.0000**). My "OLS ceiling" fed `dev(clock_period)` — the *within-design-centered* knob —
+which silently hands the model that design's mean clock period, unavailable at inference on an
+unseen design.
 
-1. **Any pooling of the graph is a design fingerprint — CONSTANT in k.** A permutation-invariant
-   readout over `h(G_D)` returns the same vector for all 108 configs. It is *structurally
-   incapable* of expressing knob response. Our ~680k-parameter encoder computes, with respect to
-   the knobs, **a constant**.
-2. **Knob response can only flow through the 5-dim knob vector.** Hence OLS-on-3-knobs beating the
-   GNN (wns 0.649 vs −1.102) is **not** a tuning failure — the GNN has *no additional information*.
-   The linear model already sees 100% of the varying input.
-3. **Hence DIRECT_KNOB is not a trick, it is the only signal path.** Measured: +0.505 on f_cts
-   buffers, +0.109 on wns. Diffusing knobs through `ctx` and K message-passing layers over a FIXED
-   graph smears the only informative input into a design-constant representation.
-4. **"pooled R² is ~99% design identity"** — we wrote that as a warning. It is literally true:
-   the pooled readout *is* design identity, by construction.
-5. **"coverage-limited" restated**: for the LEVEL task the GNN has **18 training examples** — one
-   per distinct graph — not 1944. That is the real n.
-6. **Where the GNN genuinely earns its keep**: *within* a fixed graph, which net is long / which
-   cell is critical is a structural question. Measured: per-net HPWL ranking **AUC 0.912** vs
-   Net2's 0.922. That is the job message passing is built for.
+**HONEST comparison** (train 7 designs → predict `y_dev` on held-out designs, raw knobs only):
 
-### The forced architecture
+| target | **RAW-knob OLS** (legit) | dev-knob OLS (cheats) | GNN |
+|---|---|---|---|
+| total_hpwl | 0.678 | 0.678 | +0.654 |
+| buffer_area | 0.348 | 0.348 | **+0.474** ✅ |
+| buffer_count | 0.404 | 0.404 | **+0.595** ✅ |
+| wns | **0.092** | 0.693 | −1.102 |
+| tns | **0.117** | 0.815 | −0.126 |
 
-    y(D, k)  =  Level(G_D)                 <- needs the graph        -> GNN
-              + KnobResponse(k, scalars)   <- needs only the knobs   -> direct MLP + physics prior
+For tot_hpwl/buf_area/buf_cnt raw == dev (their grids are global, so centering is a constant).
+**The GNN BEATS the honest baseline** on buf_area (+0.13) and buf_cnt (+0.19), ties on tot_hpwl.
+The earlier "OLS wins" claim is retracted.
 
-**The level/deviation split (Barsat's "is the z-score within the design?") is exactly this
-factorization.** It was never a normalization trick — it is the correct decomposition of the
-problem, and it works because it matches the information structure of the data.
+### The consequences (corrected)
+
+Write `y(D,k) = F(G_D, k)`. Since `G_D ⟂ k`:
+
+1. **Any pooling of the graph is a design fingerprint — CONSTANT in k.** It cannot express the
+   *shape* of the knob response. (This part of the original claim stands.)
+2. **BUT the response is to k RELATIVE TO DESIGN-SPECIFIC SCALES.** `clock_period = 3ns` means
+   nothing absolute — it means *tight* for des3_area (whose range is 6.0–9.3) and *loose* for
+   ac97 (1.8–3.0). The scale is a STRUCTURAL property (critical-path depth) that only the graph
+   (or the fp_wns/fp_tns anchors) can supply. Evidence: wns knob response is **0.092** from raw
+   knobs alone but **0.693** once design scale is known.
+3. **So knob response is an INTERACTION, not an addition:**
+       `y_dev  =  f( k ; θ(G_D) )`   — the graph parameterizes the response function,
+                                        the knobs excite it. BOTH are necessary.
+   This is why `dev_in = [pooled graph, ctx, RAW knobs]` in f_place is right, and why
+   `DIRECT_KNOB` matters (+0.505 on f_cts buffers): the knobs must arrive UNSMEARED to interact
+   with the design context, not diffused through K layers over a fixed graph.
+4. **"pooled R² is ~99% design identity"** is literally true, by construction.
+5. **"coverage-limited" restated**: the LEVEL task has **18 training examples** — one per distinct
+   graph — not 1944. That is the real n, and it is why absolute level is the weak axis.
+6. **Where the GNN unambiguously earns its keep**: *within* a fixed graph, which net is long /
+   which cell is critical is structural. Measured: per-net HPWL ranking **AUC 0.912** vs Net2 0.922.
+
+### The architecture this forces
+
+    y(D, k)  =  Level(G_D)              <- graph only        -> GNN pooled readout
+              + Dev( k ; θ(G_D) )       <- knobs x design    -> raw knobs + graph context,
+                                                                INTERACTING (not concatenated late)
+
+**Barsat's level/deviation split is exactly this factorization** — never a normalization trick,
+but the correct decomposition of the problem's information structure.
+**Physics supplies the form of Dev** (so the net learns a residual, not the law) — see below.
+
+### Why the wns fix worked, in these terms
+`wns_g` now has a real head fed raw knobs, and f_place already carries `fp_wns/fp_tns` anchors =
+the design's timing scale θ(G_D). Measured: **−1.102 → +0.586**, against the design-informed
+ceiling of 0.693. The model infers the scale; it just never had a head to express the response.
+(Caveat: the −1.102 is from the full cluster run, +0.586 from a 182-flow probe — directionally
+strong, not a controlled A/B.)
 
 **Physics supplies the FORM of the knob term** (so the net learns a residual, not the law):
 - HPWL ∝ √A, and A = cell_area/utilization  ⇒  `log HPWL ≈ −0.5·log(util) + c`
