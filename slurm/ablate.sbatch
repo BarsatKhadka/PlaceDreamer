@@ -54,10 +54,19 @@
 # diverged to 112.7%. Theory agrees the failure is aggregation, not representation: tot_hpwl is a
 # sum of LOCAL quantities, inside the 1-WL class (Xu GIN ICLR'19; Chen NeurIPS'20 Cor 3.4).
 #
-# cfg 3 is expected to do ~NOTHING and is here to be falsified: die_area is provably collinear
-# with utilization within a design (log die = log cell_area - log util, cell_area design-constant)
-# and measured 0.702 -> 0.702; crit_path's fair gain is only 0.091 -> 0.118 and a probe showed no
-# model gain. If cfg 3 == cfg 0, we DELETE both features rather than carry them.
+# cfg 3 now measures whether MY OWN GEOMETRY WORK **HURTS**, and I expect it does.
+# The geometry heads were UNGATED — training in every arm of the first launch, including base —
+# and they are MEASURED DEAD at FULL scale: "GEO skill" is negative every epoch (box -0.001..
+# -0.062, pos -0.064..-0.172, d=64/K=4, 756 flows). Yet W_POS=5 (x2 terms) + W_VNBOX=5 (x4 terms)
+# made them **68.2% OF THE ENTIRE LOSS**, while net_hpwl — the head that WORKS (AUC 0.912) — got
+# 11.4%. They share the encoder, so they were shaping the representation toward a task that does
+# not learn. GEO_HEADS now defaults OFF (-134k params); cfg 3 turns the whole lot back on
+# (heads + die_area/sqrt(nA) feats + crit_path knob).
+#   cfg 3 WORSE than base  => my geometry work was actively harmful; DELETE it.
+#   cfg 3 == base          => it was merely useless; DELETE it anyway.
+# Either way it goes. This arm exists to price the damage, not to rescue the idea.
+# NOTE: this is why the first launch had to be killed — with the heads ungated, cfg 0 was NOT the
+# shipped model (which had no geometry heads), so the control could not validate anything.
 
 set -euo pipefail
 mkdir -p logs runs
@@ -70,14 +79,15 @@ cd "${HOME}/PlaceDreamer"
 IDX=${SLURM_ARRAY_TASK_ID}
 CFG=$((IDX / 3)); FOLD=$((IDX % 3))
 case $CFG in
-  0) NAME=base;  WNS_HEAD=0; GEO_FEATS=0; CRIT_KNOB=0; HPWL_COMPOSE=pool; ENDPT_TARGET=slack   ;;
-  1) NAME=arriv; WNS_HEAD=0; GEO_FEATS=0; CRIT_KNOB=0; HPWL_COMPOSE=pool; ENDPT_TARGET=arrival ;;
-  2) NAME=sum;   WNS_HEAD=0; GEO_FEATS=0; CRIT_KNOB=0; HPWL_COMPOSE=sum;  ENDPT_TARGET=slack   ;;
-  3) NAME=geo;   WNS_HEAD=0; GEO_FEATS=1; CRIT_KNOB=1; HPWL_COMPOSE=pool; ENDPT_TARGET=slack   ;;
-  4) NAME=all;   WNS_HEAD=0; GEO_FEATS=0; CRIT_KNOB=0; HPWL_COMPOSE=sum;  ENDPT_TARGET=arrival ;;
+  0) NAME=base;  GEO_HEADS=0; GEO_FEATS=0; CRIT_KNOB=0; HPWL_COMPOSE=pool; ENDPT_TARGET=slack   ;;
+  1) NAME=arriv; GEO_HEADS=0; GEO_FEATS=0; CRIT_KNOB=0; HPWL_COMPOSE=pool; ENDPT_TARGET=arrival ;;
+  2) NAME=sum;   GEO_HEADS=0; GEO_FEATS=0; CRIT_KNOB=0; HPWL_COMPOSE=sum;  ENDPT_TARGET=slack   ;;
+  3) NAME=geo;   GEO_HEADS=1; GEO_FEATS=1; CRIT_KNOB=1; HPWL_COMPOSE=pool; ENDPT_TARGET=slack   ;;
+  4) NAME=all;   GEO_HEADS=0; GEO_FEATS=0; CRIT_KNOB=0; HPWL_COMPOSE=sum;  ENDPT_TARGET=arrival ;;
   *) echo "bad array index $IDX (expected 0-14)" >&2; exit 1 ;;
 esac
-export WNS_HEAD GEO_FEATS CRIT_KNOB HPWL_COMPOSE ENDPT_TARGET FOLD
+export GEO_HEADS GEO_FEATS CRIT_KNOB HPWL_COMPOSE ENDPT_TARGET FOLD
+export WNS_HEAD=0
 export ENCODER=dehnn VN_KNOBS=0 AGGR=multi FUSE=concat   # winning encoder, pinned in every arm
 export OUT="runs/ab_${NAME}"
 

@@ -263,6 +263,14 @@ CELL_IN    = len(KEEP_CELL) + 10          # 12 library + 10 PE = 22
 # and cell_area is design-constant, so it is COLLINEAR with the utilization knob.
 # Kept flagged only because it may still help the cross-design LEVEL (untested).
 GEO_FEATS  = bool(int(os.environ.get("GEO_FEATS") or "1"))
+# A/B FLAG — do the GEOMETRY HEADS (h_pos per-cell x/y, h_vnbox per-METIS-cluster bbox) exist?
+# They were UNGATED and therefore training in every arm, and they are MEASURED DEAD: "GEO skill"
+# (1 - err/trivial-baseline) is NEGATIVE every epoch at FULL scale (d=64/K=4, 756 flows) —
+# box -0.001..-0.062, pos -0.064..-0.172. Yet at W_POS=5 (x2 terms) and W_VNBOX=5 (x4 terms)
+# they were consuming 68.2% OF THE ENTIRE LOSS while net_hpwl — the head that works (AUC
+# 0.912) — got 11.4%. And they share the encoder, so they shape the representation toward a
+# task that does not learn. Default OFF: dead heads are not free.
+GEO_HEADS  = bool(int(os.environ.get("GEO_HEADS") or "0"))
 DF_IN      = len(KEEP_DF) + (2 if GEO_FEATS else 0)   # 16 netlist + 2 floorplan geometry
                                           # (log die_area, log sqrt(n*A) physics prior)
 PE_SLICE   = slice(len(KEEP_CELL), CELL_IN)   # the 10 PE dims, post-drop
@@ -906,10 +914,12 @@ class FPlace(nn.Module):
         # this is not the PE sign-ambiguity trap), while the aspect_ratio knob reorganizes the
         # layout (sasc corr y 0.92 -> 0.13 as the die goes AR 2.08 -> 0.68) -- so geometry
         # CARRIES the knob response the summary globals were crushing 18-53x.
-        self.h_pos = Linear(256, 4)                 # [mu_x, logvar_x, mu_y, logvar_y]
+        self.geo_heads = GEO_HEADS
+        if self.geo_heads:
+            self.h_pos = Linear(256, 4)             # [mu_x, logvar_x, mu_y, logvar_y]
         # per-VN BOUNDING BOX head: pool the VN's cells (mean+max) -> xmin,ymin,xmax,ymax,
         # each (mu, logvar). Coarser and far better-posed than per-cell position — see load_graph.
-        self.h_vnbox = Seq(Linear(2 * 256, 256), LeakyReLU(), Linear(256, 8))
+            self.h_vnbox = Seq(Linear(2 * 256, 256), LeakyReLU(), Linear(256, 8))
 
     def encode_pe(self, pe):
         """SignNet: rho( concat_i [ phi(v_i) + phi(-v_i) ] ). Invariant to v_i -> -v_i by
@@ -964,7 +974,7 @@ class FPlace(nn.Module):
         dev_in = [h.mean(0), h.max(0).values, h_net.mean(0), h_net.max(0).values, ctx]
         if self.direct_knob: dev_in.append(g["knobs"])
         hd = self.fc1_dev(torch.cat(dev_in))
-        p = self.h_pos(hc)                           # per-cell normalized (x, y) geometry
+        p = self.h_pos(hc) if self.geo_heads else None
         # ANALYTIC COMPOSITION (HPWL_COMPOSE="sum"): tot_hpwl = SUM_net HPWL_net is an IDENTITY.
         # Undo net_hpwl's standardization to get log-um, exp -> um, sum -> log. Kept inside the
         # model so the aggregate is DIFFERENTIABLE and can be supervised: that is what forces the
@@ -984,8 +994,10 @@ class FPlace(nn.Module):
                         scatter(hc, g["part_cell"], 0, dim_size=g["num_vn"], reduce="max")], 1)
         o = dict(net_hpwl=self.h_net_hpwl(hn),
                  endpt=self.h_endpt(hc),             # per-cell slack; WNS/TNS read out in train
-                 pos_x=p[:, 0:2], pos_y=p[:, 2:4],   # each (mu, logvar) -> gnll like every head
-                 vn_box=self.h_vnbox(vb).view(-1, 4, 2))    # [nvn, 4 coords, (mu, logvar)]
+                 )
+        if self.geo_heads:
+            o["pos_x"], o["pos_y"] = p[:, 0:2], p[:, 2:4]    # each (mu, logvar)
+            o["vn_box"] = self.h_vnbox(vb).view(-1, 4, 2)    # [nvn, 4 coords, (mu, logvar)]
         if hpwl_sum is not None:
             o["tot_hpwl_sum"] = hpwl_sum             # log um, composed by identity — supervised
                                                      # in train_fplace against the true log total

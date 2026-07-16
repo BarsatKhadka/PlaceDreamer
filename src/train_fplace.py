@@ -141,7 +141,7 @@ def wloss(out, g, nll=True):
     # PLACEMENT GEOMETRY — the densest target we have (every cell, ~100% coverage). This is what
     # the seam actually needs to carry: CTS is a function of where the sinks landed, not of a
     # scalar total-HPWL. Weighted like net_hpwl (both are dense per-node structure).
-    if "y_pos_x" in g:
+    if fplace.GEO_HEADS and "y_pos_x" in g:
         L = L + W["pos"] * (gnll(out["pos_x"], g["y_pos_x"], g["m_pos"], nll)
                           + gnll(out["pos_y"], g["y_pos_y"], g["m_pos"], nll))
     # ANALYTIC COMPOSITION: supervise tot_hpwl = SUM_net HPWL_net directly (HPWL_COMPOSE=sum).
@@ -152,7 +152,7 @@ def wloss(out, g, nll=True):
     if "tot_hpwl_sum" in out and "y_tot_hpwl" in g:
         L = L + W["hpwl_sum"] * (out["tot_hpwl_sum"] - g["y_tot_hpwl"]) ** 2
     # per-VN bounding box (xmin,ymin,xmax,ymax) — the well-posed geometry target.
-    if "y_vnbox" in g and g["m_vnbox"].any():
+    if fplace.GEO_HEADS and "y_vnbox" in g and g["m_vnbox"].any():
         for i in range(4):
             L = L + W["vnbox"] * gnll(out["vn_box"][:, i], g["y_vnbox"][:, i], g["m_vnbox"], nll)
     # global targets: LEVEL + knob DEVIATION, both O(1). The deviation is up-weighted because
@@ -187,12 +187,12 @@ def evaluate(model, flows):
         # ---- GEOMETRY, scored against the trivial predictor it must beat ----
         # boxes are die-normalized, so every design is on the same [0,1] scale and one mean box
         # is a fair baseline. If the model cannot beat it, it has learned no geometry.
-        mv = g["m_vnbox"]
-        if mv.any():
+        mv = g["m_vnbox"] if ("m_vnbox" in g and fplace.GEO_HEADS) else None
+        if mv is not None and mv.any():
             pb = o["vn_box"][mv,:,0].cpu().numpy(); tb = g["y_vnbox"][mv].cpu().numpy()
             geo["box_m"].append(np.abs(pb-tb).mean(1)); geo["box_b"].append(np.abs(BASE[None,:]-tb).mean(1))
-        mp = g["m_pos"]
-        if mp.any():
+        mp = g["m_pos"] if ("m_pos" in g and fplace.GEO_HEADS) else None
+        if mp is not None and mp.any():
             px, py = o["pos_x"][mp,0].cpu().numpy(), o["pos_y"][mp,0].cpu().numpy()
             tx, ty = g["y_pos_x"][mp].cpu().numpy(), g["y_pos_y"][mp].cpu().numpy()
             geo["pos_m"].append(np.sqrt((px-tx)**2+(py-ty)**2))
