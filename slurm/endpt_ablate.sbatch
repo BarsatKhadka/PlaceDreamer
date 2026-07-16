@@ -42,7 +42,17 @@
 #
 # WHAT TO LOOK FOR IN THE LOG — the LAST TEST block of each run:
 #     endpt   abs-R2   <- THE NUMBER. delta should beat slack. If it doesn't, tell me.
-#     wns     med_ae   <- real ns. Untrained baselines were slack 0.76 / arrival 1.62 / delta 0.16
+#     wns     med_ae   <- real ns. THE BAR IS THE FREE PRIOR (predict delta=0, ZERO params).
+#                         MEASURED on fold 0, and IT IS PER-SPLIT — do not compare across splits:
+#                            VAL  (des3_area, spi)                    wns med_ae 2.575 ns
+#                                  des3_area 10.393 | spi 2.545       <- des3_area dominates
+#                            TEST (ac97_ctrl, sasc, systemcdes, usb_funct)  wns med_ae 0.970 ns
+#                                  ac97 0.744 | sasc 0.187 | systemcdes 3.295 | usb_funct 1.476
+#                         The per-epoch line prints VAL. The last TEST block prints TEST. I once
+#                         quoted "0.16 ns" here from memory and then compared a VAL log against a
+#                         TEST baseline and called a healthy run broken. The bar is 2.575 on VAL.
+#                         Training STARTS above the prior and descends: ep0 6.85 -> ep2 4.33.
+#                         That is normal. The question is whether it lands BELOW the prior by ep200.
 #     net_hpwl AUC     <- MUST NOT REGRESS. It is 0.912 and it is the head that works.
 #                         If changing the timing target damages HPWL, the heads are fighting.
 #     calib z2 -> 1.0  <- has NEVER been reported by any run. First look at whether sigma is honest.
