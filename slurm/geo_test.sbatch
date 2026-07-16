@@ -40,5 +40,16 @@ export ENCODER=dehnn VN_KNOBS=0 AGGR=multi FUSE=concat   # f_place's winning enc
 export FOLD=${SLURM_ARRAY_TASK_ID} OUT=runs/fplace_geo
 
 python -c "import torch; assert torch.cuda.is_available(), 'CUDA NOT VISIBLE'; print('GPU:', torch.cuda.get_device_name(0))"
+
+# cache/coords is UNTRACKED (91MB of npz) — `git pull` does NOT bring it, it must be generated
+# on this machine. Without this guard the job dies with a bare FileNotFoundError deep inside
+# load_graph, right after set_norm prints, which looks like "it trains then exits".
+NG=$(ls cache/graphs/*.npz 2>/dev/null | wc -l); NC=$(ls cache/coords/*.npz 2>/dev/null | wc -l)
+if [ "$NC" -ne "$NG" ] || [ "$NC" -eq 0 ]; then
+  echo "FATAL: cache/coords has ${NC} flows but cache/graphs has ${NG}." >&2
+  echo "       Run:  python scripts/add_place_coords.py   (~1 min) then resubmit." >&2
+  exit 1
+fi
+echo "cache/coords OK: ${NC} flows"
 echo "=== fold ${FOLD}: f_place + geometry (cell_pos + vn_box). Watch GEO skill. ==="
 python src/train_fplace.py
