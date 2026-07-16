@@ -40,6 +40,16 @@ def seam_dims():
     return dict(cell=(1 if on else 0), net=(1 if on else 0),
                 df=(2 * len(seam.PLACE_GLOBAL) if on else 0))
 
+KNOB = 5                                      # raw knob vector width (matches fplace)
+# A/B FLAG, not an assumption: do the RAW knobs get a direct path into the deviation heads?
+# f_place has exactly this (fplace.DIRECT_KNOB, default on, A/B-validated). f_cts never did —
+# its knobs only reached the dev heads through ctx = MLP([knobs, dfeat]), mixed with 16 design
+# features and diffused through K message-passing layers. Measured OLS ceilings from the raw
+# knobs alone (within-design R2): cts_power 0.905 (clock_period; P = a*C*V^2*f),
+# cts_buffers 0.271 (utilization -> die area -> sink spread -> clock WL), cts_wns 0.538.
+# f_cts was scoring ~0 on all three, so the signal was present but unreachable. Flag it so the
+# claim is MEASURED by an A/B rather than asserted.
+CTS_DIRECT_KNOB = bool(int(os.environ.get("CTS_DIRECT_KNOB") or "1"))
 CTS_GLOBAL = ("cts_buffers", "cts_power")     # level + knob-deviation (like tot_hpwl/buf_area)
 CTS_TIMING = ("cts_wns", "cts_tns")           # signed; level + deviation
 
@@ -141,6 +151,21 @@ class FCTS(nn.Module):
         # ceiling is +0.96. total_power is a WHOLE-design quantity; only buffers are sink-scoped.
         self.fc_sink  = Seq(Linear(2*d + d, 256), LeakyReLU(), Linear(256, 256))   # sinks + ctx
         self.fc_whole = Seq(Linear(4*d + d, 256), LeakyReLU(), Linear(256, 256))   # cells,nets + ctx
+        # SEPARATE DEVIATION PATHWAY WITH A DIRECT KNOB PATH — mirrors f_place's DIRECT_KNOB.
+        # THE BUG THIS FIXES: every CTS knob response is driven by a knob f_cts ALREADY has, and
+        # it was scoring ~0 on all of them. Measured within-design R2 from the raw knobs alone:
+        #     cts_power   0.905 from clock_period   (P = alpha*C*V^2*f -> power ~ 1/period)
+        #     cts_buffers 0.271 from utilization    (die area -> sink spread -> clock WL)
+        #     cts_wns     0.538 from clock_period
+        # NONE of it needs placement geometry. But the knobs only reached the dev heads through
+        # ctx = MLP([knobs, dfeat]) -- mixed with 16 design features and diffused through K layers
+        # of message passing. f_place hit the same wall and solved it by feeding the RAW knobs
+        # straight into the deviation head; f_cts never got that path. A 0.9-R2 signal was sitting
+        # in the input unreachable.
+        self.direct_knob = CTS_DIRECT_KNOB
+        kd = KNOB if self.direct_knob else 0
+        self.fc_sink_dev  = Seq(Linear(2*d + d + kd, 256), LeakyReLU(), Linear(256, 256))
+        self.fc_whole_dev = Seq(Linear(4*d + d + kd, 256), LeakyReLU(), Linear(256, 256))
         self.scope = {"cts_buffers": "sink", "cts_power": "whole",
                       "cts_wns": "whole", "cts_tns": "whole"}
         self.h_lvl = nn.ModuleDict({k: Linear(256, 2) for k in CTS_GLOBAL + CTS_TIMING})
@@ -150,13 +175,18 @@ class FCTS(nn.Module):
         h, h_net, ctx = self.enc.encode(g)          # SAME winning encoder as f_place
         sm = g["sink_mask"]
         hs = h[sm] if sm.sum() >= 1 else h
-        z_sink  = F.leaky_relu(self.fc_sink(torch.cat([hs.mean(0), hs.max(0).values, ctx])))
-        z_whole = F.leaky_relu(self.fc_whole(torch.cat([
-            h.mean(0), h.max(0).values, h_net.mean(0), h_net.max(0).values, ctx])))
-        z = {"sink": z_sink, "whole": z_whole}
+        pool_sink  = [hs.mean(0), hs.max(0).values, ctx]
+        pool_whole = [h.mean(0), h.max(0).values, h_net.mean(0), h_net.max(0).values, ctx]
+        # LEVEL: which design is this — pooled graph is what carries design size.
+        zL = {"sink":  F.leaky_relu(self.fc_sink(torch.cat(pool_sink))),
+              "whole": F.leaky_relu(self.fc_whole(torch.cat(pool_whole)))}
+        # DEVIATION: what the knobs did — the RAW knobs go in DIRECTLY (see __init__).
+        kn = [g["knobs"]] if self.direct_knob else []
+        zD = {"sink":  F.leaky_relu(self.fc_sink_dev(torch.cat(pool_sink + kn))),
+              "whole": F.leaky_relu(self.fc_whole_dev(torch.cat(pool_whole + kn)))}
         o = {}
         for k in CTS_GLOBAL + CTS_TIMING:
-            zk = z[self.scope[k]]
-            o[f"{k}_lvl"] = self.h_lvl[k](zk)
-            o[f"{k}_dev"] = self.h_dev[k](zk)
+            s = self.scope[k]
+            o[f"{k}_lvl"] = self.h_lvl[k](zL[s])
+            o[f"{k}_dev"] = self.h_dev[k](zD[s])       # knob response, fed the knobs directly
         return o

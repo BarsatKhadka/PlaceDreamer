@@ -27,7 +27,7 @@ NOT reproduced (and it matters): DE-HNN passes gcn_norm edge weights and drops n
 fanout >= 3000. We do neither -> the clock net (fanout 10k) sends a message of norm ~68,672 vs
 8.3 for a 2-pin net. See docs/fplace_audit.md A2. STILL OPEN.
 """
-import os, glob, numpy as np, pandas as pd, torch, torch.nn as nn, torch.nn.functional as F
+import os, glob, hashlib, numpy as np, pandas as pd, torch, torch.nn as nn, torch.nn.functional as F
 from torch.nn import Sequential as Seq, Linear, ReLU, LeakyReLU
 from torch_geometric.nn import SimpleConv
 from torch_geometric.utils import scatter, dropout_edge
@@ -56,6 +56,8 @@ VN_KNOBS = bool(int(os.environ.get("VN_KNOBS") or "1"))  # A/B: do the knobs rid
 # hurts, or just the knob DELIVERY through it?
 # NOTE: DE-HNN uses NEITHER sum NOR mean. They use gcn_norm-weighted sum
 # (train_all_cross.py:85-87): each edge weighted 1/sqrt(deg_i*deg_j). AGGR=gcn is that.
+# bump when set_norm's CONTENT changes (new keys/stats) so stale caches invalidate
+NORM_VERSION = 2
 N_TYPES = 442            # 441 real cell types + 1 UNK slot (index 441)
 UNK_TYPE = 441
 
@@ -274,10 +276,22 @@ def set_norm(train_designs, force=False):
     Call this ONCE per fold, before any load_graph().
     """
     global _NORM
-    key = hash(tuple(sorted(train_designs))) & 0xffffffff
-    f = f"{ROOT}/cache/norm_{key:08x}.npz"
+    # STABLE key. This used to be hash(tuple(...)), but Python randomizes string hashing per
+    # process (PYTHONHASHSEED), so the same train split produced a DIFFERENT filename every run:
+    # the cache never hit across processes, every run silently rebuilt, and cache/ filled with
+    # orphan norm_*.npz. It also hid the allow_pickle bug below, which only fires when the cache
+    # actually loads. NORM_VERSION invalidates stale caches whenever the norm CONTENT changes
+    # (bump it when you add/alter a key here) — otherwise a working cache would serve a norm
+    # missing newly-added entries and fail far away with a confusing KeyError.
+    key = hashlib.md5(("|".join(sorted(train_designs)) + f"|v{NORM_VERSION}").encode()).hexdigest()[:8]
+    f = f"{ROOT}/cache/norm_{key}.npz"
     if not force and os.path.exists(f):
-        _NORM = dict(np.load(f)); return _NORM
+        # allow_pickle=True is REQUIRED, not cosmetic: set_norm saves per-design key arrays
+        # (MU_{k}_keys / W_{k}_keys come from a pandas index of design names -> object dtype).
+        # Loading them without it raises "Object arrays cannot be loaded when allow_pickle=False",
+        # so ANY run that hits an existing norm cache dies — e.g. re-running a fold, or f_cts
+        # reusing the norm f_place just built for the same train split.
+        _NORM = dict(np.load(f, allow_pickle=True)); return _NORM
 
     cx, nx, df, ynh = [], [], [], []
     for dsg in sorted(train_designs):                       # stratified: every train design

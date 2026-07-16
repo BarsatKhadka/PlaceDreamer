@@ -451,10 +451,18 @@ def print_metrics(res, title):
         print(f"      recall@10%               {n['recall_top10']:.3f}   "
               f"(of the truly-longest 10%, how many we rank in our top 10%)")
         print(f"      20-bin correlation       {n['bin20_r']:.3f}   (Net2: 0.98, top 5% excluded)")
-        print("      NOTE: absolute per-net length is UNDER-DETERMINED pre-placement (Net2 found")
-        print("      725 nets with identical local features spanning 1um..100um). Net2/MacroRank/")
-        print("      Huang'19 all abandoned absolute regression for ranking. f_route needs the")
-        print("      RANKING (which nets are long/congested), not the absolute value.")
+        print("      NOTE: Net2 (ASP-DAC'21) REGRESSES net length (label = post-placement bbox")
+        print("      HPWL) — it does NOT use a ranking loss. What it never publishes is a um-level")
+        print("      absolute error: it reports only binned correlation (>0.98) and top-10% AUC")
+        print("      (92.5), the standard protocol in net-length works. So the field evaluates")
+        print("      this ORDINALLY, which is why we do too — not because regression is")
+        print("      impossible. Ranking is chosen for DECISION-THEORETIC reasons: MacroRank")
+        print("      (ASP-DAC'23) picks a rank loss because 'the relative relationship ... is")
+        print("      noteworthy instead of the absolute value', and shows the dissociation —")
+        print("      EHNN has the best MRE but near-zero Kendall tau until the loss is swapped.")
+        print("      (Net2's 725 nets with identical local features spanning 1um..100um is real,")
+        print("      but they use it to argue for a GLOBAL RECEPTIVE FIELD, not to drop")
+        print("      regression.) f_route needs the RANKING — which nets are long/congested.")
     print("\n   (within-R² = knob-response with design size held constant — THE number."
           "  calib z² -> 1.0 = honest sigma.\n"
           "    pooled R² is ~99% design-identity for the global targets — do not trust it.)",
