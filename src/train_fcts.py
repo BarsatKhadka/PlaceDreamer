@@ -16,10 +16,24 @@ DEV    = "cuda" if torch.cuda.is_available() else "cpu"
 # f_place's prediction (needs FPLACE_CKPT). We run "real" FIRST — it's the compounding baseline.
 SEAM_MODE  = E("SEAM_MODE", "") or None
 FPLACE_CKPT = E("FPLACE_CKPT", "")   # required for SEAM_MODE=imagined (a trained f_place fold.pt)
+# WARM START — PowPrediCT's (DAC'24) SCHEDULE, which is the part we were missing.
+# We train `real` and `imagined` as SEPARATE models; they PRETRAIN teacher-forced on the real
+# upstream state and THEN FINE-TUNE on the imagined one, and that step IS their result:
+#   cross-design LOO total-power rel-err — Innovus 9.652% | vanilla GNN 14.149% (worse than the
+#   tool!) | Phase-1-only 5.106% | full (1->3) 1.981%.   The 1->3 fine-tune more than HALVES it.
+# Their Phase1 = pretrain on post-route graphs; Phase3 = swap the input to placement graphs and
+# fine-tune. That is teacher forcing -> student forcing; they never name it.
+# MasterRTL IV.A says the same thing harder: chained-on-PREDICTED beat chained-on-REAL
+# (TNS MAPE 4% vs 62%) — the downstream model learns to INVERT the upstream model's systematic
+# bias, which it cannot do if it only ever sees clean input.
+# => set WARM_START=<dir with foldN.pt> (a SEAM_MODE=real run) and SEAM_MODE=imagined, with a
+#    lower LR. This is the arm the literature says wins, and we did not have it.
+WARM_START = E("WARM_START", "")     # dir of a trained (usually SEAM_MODE=real) f_cts to start from
 EPOCHS = int(E("EPOCHS", 200)); LR = float(E("LR", 1e-3))
 DIM    = int(E("DIM", 64)); LAYERS = int(E("LAYERS", 4)); ACCUM = int(E("ACCUM", 8))
 SEED   = int(E("SEED", 0)); ENCODER = E("ENCODER", "dehnn")
 W_DEV  = float(E("W_DEV", 3))       # up-weight the knob deviation — the thing the agent needs
+FT_LR_MULT = float(E("FT_LR_MULT", 0.1))   # fine-tune LR multiplier when WARM_START is set
 OUT    = E("OUT", "runs/fcts")
 ALL    = CTS_GLOBAL + CTS_TIMING
 torch.manual_seed(SEED); random.seed(SEED); np.random.seed(SEED); os.makedirs(OUT, exist_ok=True)
@@ -85,7 +99,15 @@ def run_fold(fi, test_designs, dev):
         raise SystemExit("SEAM_MODE=imagined needs FPLACE_CKPT=<dir with foldN.pt>")
     fcts.set_seam(SEAM_MODE, place_model)          # TRAINING consumes SEAM_MODE's placement state
     model = FCTS(d=DIM, K=LAYERS, encoder=ENCODER).to(DEV)
-    opt = torch.optim.Adam(model.parameters(), lr=LR)
+    if WARM_START:
+        # PowPrediCT Phase1 -> Phase3: keep the teacher-forced weights, swap the INPUT to the
+        # imagined state, continue at low LR. The seam dims are identical in real/imagined mode
+        # (only the VALUES differ), so the checkpoint loads unchanged.
+        sd = torch.load(f"{WARM_START}/fold{fi}.pt", map_location=DEV)
+        model.load_state_dict(sd)
+        print(f"    WARM START from {WARM_START}/fold{fi}.pt  -> fine-tuning on SEAM={SEAM_MODE}",
+              flush=True)
+    opt = torch.optim.Adam(model.parameters(), lr=(LR * FT_LR_MULT if WARM_START else LR))
     sched = torch.optim.lr_scheduler.ReduceLROnPlateau(opt, mode="max", factor=0.5, patience=10, min_lr=1e-5)
     best, best_state = -1e9, None
     for ep in range(EPOCHS):
