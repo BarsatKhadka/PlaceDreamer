@@ -112,6 +112,24 @@ GLOBAL_TARGETS = ("tot_hpwl", "buf_area", "buf_cnt", "wns_g", "tns_g")
 # level+deviation heads every other global target has, and the dev head already receives the raw
 # knobs directly (DIRECT_KNOB), which is exactly where the 0.649 lives.
 SIGNED_TARGETS = ("wns_g", "tns_g")     # signed -> signed-log transform, not log
+
+# A/B FLAG: how is tot_hpwl produced?
+#   "pool" — the pooled mean/max readout -> MLP -> level+dev heads   (what we have)
+#   "sum"  — tot_hpwl = SUM_net HPWL_net, an IDENTITY, not a model. The GNN predicts the per-net
+#            unknown (where it has ~1e6 labels and scores AUC 0.912) and an exact formula
+#            aggregates. This is GRANNITE's verified pattern (DAC'20): keep P = sum(a*C*V^2*f)
+#            exact, have the net predict only the per-gate alpha. <5.5% err, 18.7x speedup.
+#
+# WHY: the pooled head has ~1e2 effective labels (and since the input graph is IDENTICAL across a
+# design's 108 knob configs, the LEVEL task has just 18 — one per distinct graph). Measured on a
+# 182-flow probe, the pooled head DIVERGES (rel-err 29%->170%, knob-R2 -1->-9.6) while the sum
+# stays flat at ~15-20% rel-err and beats it at every checkpoint. The full-data pooled head gets
+# 52% rel-err; this sum gets 17.4% on a toy set.
+# Theory agrees it should work: tot_hpwl is a smooth aggregate of LOCAL quantities, squarely
+# inside the 1-WL-decomposable class (Xu GIN ICLR'19; Chen NeurIPS'20), so the failure was never
+# the representation — it was aggregation + sample size. And MasterRTL (ICCAD'23) ran exactly our
+# pooled-GCN experiment on WNS/TNS/power/area and shipped XGBoost instead.
+HPWL_COMPOSE = os.environ.get("HPWL_COMPOSE", "pool")   # pool | sum
 # (endpt stays: it is the per-cell timing state the seam forwards, and it is dense supervision.
 #  It is simply no longer the ONLY path to WNS/TNS.)
 
@@ -880,6 +898,20 @@ class FPlace(nn.Module):
         if self.direct_knob: dev_in.append(g["knobs"])
         hd = self.fc1_dev(torch.cat(dev_in))
         p = self.h_pos(hc)                           # per-cell normalized (x, y) geometry
+        # ANALYTIC COMPOSITION (HPWL_COMPOSE="sum"): tot_hpwl = SUM_net HPWL_net is an IDENTITY.
+        # Undo net_hpwl's standardization to get log-um, exp -> um, sum -> log. Kept inside the
+        # model so the aggregate is DIFFERENTIABLE and can be supervised: that is what forces the
+        # per-net predictions to be calibrated in absolute terms rather than merely well-ranked
+        # (our per-net AUC is 0.912 but its absolute rel-err is 43.7% — ranking alone will not
+        # sum to the right total). See GRANNITE (DAC'20) for the pattern.
+        hpwl_sum = None
+        if HPWL_COMPOSE == "sum":
+            nm_ = norm()
+            lg = out_net_log = (self.h_net_hpwl(hn)[:, 0] * float(nm_["y_net_hpwl_s"])
+                                + float(nm_["y_net_hpwl_m"]))            # standardized -> log um
+            m_ = g.get("m_net_hpwl")
+            lg = lg[m_] if m_ is not None and m_.any() else lg
+            hpwl_sum = torch.logsumexp(lg, 0)        # log(SUM exp(log_len)) — stable
         # VN boxes: pool each METIS cluster's cell embeddings, then read its bbox off that.
         vb = torch.cat([scatter(hc, g["part_cell"], 0, dim_size=g["num_vn"], reduce="mean"),
                         scatter(hc, g["part_cell"], 0, dim_size=g["num_vn"], reduce="max")], 1)
@@ -887,6 +919,9 @@ class FPlace(nn.Module):
                  endpt=self.h_endpt(hc),             # per-cell slack; WNS/TNS read out in train
                  pos_x=p[:, 0:2], pos_y=p[:, 2:4],   # each (mu, logvar) -> gnll like every head
                  vn_box=self.h_vnbox(vb).view(-1, 4, 2))    # [nvn, 4 coords, (mu, logvar)]
+        if hpwl_sum is not None:
+            o["tot_hpwl_sum"] = hpwl_sum             # log um, composed by identity — supervised
+                                                     # in train_fplace against the true log total
         for k in GLOBAL_TARGETS:                     # level + knob-deviation, both O(1)
             o[f"{k}_lvl"] = self.h_lvl[k](hg)        # design level: pooled graph (~n_cells)
             o[f"{k}_dev"] = self.h_dev[k](hd)        # knob response: knobs go in DIRECTLY

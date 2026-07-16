@@ -68,6 +68,7 @@ W = dict(net_hpwl=float(E("W_NETHPWL", 5)),        # dense: ~10k nets/flow
          # other globals; the dev head already gets the raw knobs (DIRECT_KNOB), which is
          # exactly where that 0.649 lives.
          wns_g=float(E("W_WNS", 1)), tns_g=float(E("W_TNS", 1)),
+         hpwl_sum=float(E("W_HPWL_SUM", 3)),   # calibrates per-net preds to the true total
          pos=float(E("W_POS", 5)),                 # dense: EVERY cell — placement GEOMETRY
          vnbox=float(E("W_VNBOX", 5)),             # per-METIS-cluster bbox — the POSED geometry
          dev=float(E("W_DEV", 3)))                 # knob-DEVIATION weight (the thing we want)
@@ -142,6 +143,13 @@ def wloss(out, g, nll=True):
     if "y_pos_x" in g:
         L = L + W["pos"] * (gnll(out["pos_x"], g["y_pos_x"], g["m_pos"], nll)
                           + gnll(out["pos_y"], g["y_pos_y"], g["m_pos"], nll))
+    # ANALYTIC COMPOSITION: supervise tot_hpwl = SUM_net HPWL_net directly (HPWL_COMPOSE=sum).
+    # Plain MSE in log-space, no sigma: this term's job is to CALIBRATE the per-net predictions in
+    # absolute terms so their sum reproduces the true total. Ranking alone does not (per-net AUC
+    # 0.912 but 43.7% absolute rel-err). Measured on a 182-flow probe: the composed sum holds
+    # ~15-20% rel-err while the pooled head diverges to 170%.
+    if "tot_hpwl_sum" in out and "y_tot_hpwl" in g:
+        L = L + W["hpwl_sum"] * (out["tot_hpwl_sum"] - g["y_tot_hpwl"]) ** 2
     # per-VN bounding box (xmin,ymin,xmax,ymax) — the well-posed geometry target.
     if "y_vnbox" in g and g["m_vnbox"].any():
         for i in range(4):
