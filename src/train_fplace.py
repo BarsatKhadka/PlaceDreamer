@@ -369,13 +369,14 @@ def run_fold(fi, test_designs, all_designs):
         score = (-float(np.mean(errs)) if errs else -1e9) + (float(np.mean(devs)) if devs else 0.0)
         sched.step(score)
         lr_now = opt.param_groups[0]["lr"]
-        e_ = lambda k: v[k]["med_rel"] if k in v else float("nan")
+        # ABSOLUTE error in REAL units (um / um2 / cells / ns) — median |pred - true|, so you can
+        # watch the physical error shrink. r_ is the knob-response R2 (the thing being optimized).
+        a_ = lambda k: v[k]["med_ae"] if k in v else float("nan")
         r_ = lambda k: v[k].get("r2", float("nan")) if k in v else float("nan")
-        w_ = lambda k: v[k].get("within_r2", float("nan")) if k in v else float("nan")
-        print(f"  ep {ep:3d} tr {tot/len(tr):7.3f} | VAL(held-out) err: hpwl {e_('net_hpwl')*100:5.1f}% "
-              f"tot {e_('tot_hpwl')*100:5.1f}% bufC {e_('buf_cnt')*100:5.1f}% wns {e_('wns'):.2f}ns "
-              f"|| KNOB-RESPONSE R²: tot {r_('tot_hpwl_dev'):+.3f} bufA {r_('buf_area_dev'):+.3f} "
-              f"bufC {r_('buf_cnt_dev'):+.3f} | within-R² tot {w_('tot_hpwl'):+.2f} "
+        print(f"  ep {ep:3d} tr {tot/len(tr):7.3f} | VAL abs-err: "
+              f"hpwl {a_('net_hpwl'):6.2f}um tot {a_('tot_hpwl'):9.0f}um bufA {a_('buf_area'):7.1f}um2 "
+              f"bufC {a_('buf_cnt'):5.1f}cells endpt {a_('endpt'):.2f}ns wns {a_('wns'):.2f}ns tns {a_('tns'):7.1f}ns "
+              f"| knob-R2 tot {r_('tot_hpwl_dev'):+.2f} bufA {r_('buf_area_dev'):+.2f} bufC {r_('buf_cnt_dev'):+.2f} "
               f"| lr {lr_now:.1e} ({time.time()-t0:.0f}s)", flush=True)
         if score > best + 1e-4:
             best, best_state, patience = score, {k:v.detach().cpu().clone() for k,v in model.state_dict().items()}, 0
