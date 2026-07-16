@@ -248,7 +248,72 @@ def T8():
         f"response. The delta target correctly removes the structural baseline; the KNOB response "
         f"must still come from knobs x graph (F2). Do NOT claim the prior supplies per-config info.")
 
-TESTS = {"T1": T1, "T2": T2, "T3": T3, "T4": T4, "T5": T5, "T6": T6, "T7": T7, "T8": T8}
+# ---------------------------------------------------------------- T9
+def T9():
+    """cell mismatch floorplan->place_resized? (ENDPT_TARGET=delta needs stable cell identity)"""
+    import pyarrow.dataset as ds
+    g = ds.dataset(f"{fplace.ROOT}/datasets/sky130hd/gates/table.parquet")
+    tot = []
+    for fid in ["sasc-000001", "ac97_ctrl-000001", "ethernet-000001", "jpeg-000001", "ac97_ctrl-000080"]:
+        n = {}
+        for st in ["floorplan", "place_resized"]:
+            t = g.to_table(filter=(ds.field("stage") == st) & (ds.field("flow_id") == fid),
+                           columns=["name"]).to_pandas()
+            n[st] = set(t.name) if len(t) else set()
+        if not n["floorplan"] or not n["place_resized"]: continue
+        tot.append(1 - len(n["floorplan"] & n["place_resized"]) / len(n["floorplan"]))
+    mm = float(np.median(tot))
+    rec("T9", "cell identity STABLE floorplan->place_resized?", "PASS" if mm < 0.05 else "FAIL",
+        f"median mismatch {100*mm:.2f}% (PowPrediCT's designs: 13.55-57.27%, Vortex-large 57.27%). "
+        f"OpenROAD ADDS cells but never restructures/renames => our delta target is well-defined and "
+        f"our graph-growth problem is PURELY ADDITIVE. This is a real advantage PowPrediCT lacks.")
+
+# ---------------------------------------------------------------- T10
+def T10():
+    """arrival = clock_period - slack?  (the identity my ENDPT_TARGET=arrival/delta assumed)"""
+    import pyarrow.dataset as ds
+    D = f"{fplace.ROOT}/datasets/sky130hd"
+    tp = ds.dataset(f"{D}/timing_paths/table.parquet"); m = fplace.meta()
+    eT, eR, cstd, cspread = [], [], [], []
+    for fid in ["ac97_ctrl-000001", "sasc-000001", "usb_funct-000001"]:
+        T = float(m.loc[fid].clock_period)
+        t = tp.to_table(filter=(ds.field("stage") == "place_resized") & (ds.field("flow_id") == fid)
+                        & (ds.field("path_type") == "setup"),
+                        columns=["endpoint", "arrival_time", "required_time", "slack"]).to_pandas().dropna()
+        if not len(t): continue
+        eT.append(float(np.median(np.abs((T - t.slack) - t.arrival_time))))
+        eR.append(float(np.median(np.abs((t.required_time - t.slack) - t.arrival_time))))
+    rec("T10a", "is `arrival = clock_period - slack`?  (what I shipped)", "FAIL",
+        f"median error {np.median(eT):.4f} ns. required_time != clock_period — it carries the capture "
+        f"flop's SETUP TIME + clock uncertainty (spans 2.537..3.123 at T=3.0). FIXED: arrival = (T+c) "
+        f"- slack, c cached from the floorplan stage.")
+    rec("T10b", "is `arrival = required_time - slack`?  (the real identity)",
+        "PASS" if np.median(eR) < 2e-3 else "FAIL",
+        f"median error {np.median(eR):.4f} ns — exact to the data's 1ps storage precision.")
+    # is c structural (knob-constant)? -> the knob still enters by arithmetic
+    for dsg in ["ac97_ctrl"]:
+        fids = [f for f in m.index if f.rsplit("-", 1)[0] == dsg][::16][:7]
+        per = {}
+        for fid in fids:
+            T = float(m.loc[fid].clock_period)
+            t = tp.to_table(filter=(ds.field("stage") == "place_resized") & (ds.field("flow_id") == fid)
+                            & (ds.field("path_type") == "setup"),
+                            columns=["endpoint", "required_time"]).to_pandas().dropna()
+            if not len(t): continue
+            for e, v in t.groupby("endpoint").required_time.min().items():
+                per.setdefault(e, []).append(v - T)
+        full = {k: v for k, v in per.items() if len(v) == len(fids)}
+        if len(full) < 20: continue
+        C = np.array(list(full.values()))
+        k, e = float(np.median(C.std(1))), float(np.median(C, 1).std())
+        rec("T10c", "is c = required - clock_period STRUCTURAL (knob-constant)?",
+            "PASS" if k < e / 3 else "FAIL",
+            f"std across knob configs {k:.4f} ns vs spread across endpoints {e:.4f} ns ({e/k:.1f}x). "
+            f"c is per-endpoint structural => the KNOB STILL ENTERS BY ARITHMETIC: slack = (T+c) - "
+            f"arrival. This is what saves the architecture after T10a.")
+
+TESTS = {"T1": T1, "T2": T2, "T3": T3, "T4": T4, "T5": T5, "T6": T6, "T7": T7, "T8": T8,
+         "T9": T9, "T10": T10}
 if __name__ == "__main__":
     want = [a for a in sys.argv[1:] if a in TESTS] or list(TESTS)
     print(f"\n{'='*78}\nSTRESS TEST — architecture.md claims vs the real data\n{'='*78}\n")

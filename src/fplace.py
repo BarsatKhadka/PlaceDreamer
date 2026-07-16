@@ -434,13 +434,14 @@ def set_norm(train_designs, force=False):
         for p in sorted(glob.glob(f"{ROOT}/cache/endpt/{dsg}-*.npz"))[::11][:10]:
             _v = np.load(p)["ep_slack"]
             _fid = os.path.basename(p)[:-4]
-            if ENDPT_TARGET in ("arrival", "delta") and _fid in _mt.index:
-                _v = float(_mt.loc[_fid].clock_period) - _v          # -> arrival
+            _fpz = f"{ROOT}/cache/fp_arrival/{_fid}.npz"
+            if ENDPT_TARGET in ("arrival", "delta") and _fid in _mt.index and os.path.exists(_fpz):
+                _c = np.load(_fpz)["req_offset"][np.load(p)["ep_idx"]]
+                _v = (float(_mt.loc[_fid].clock_period) + _c) - _v   # -> arrival = (T+c) - slack
             if ENDPT_TARGET == "delta":
                 _fp = f"{ROOT}/cache/fp_arrival/{_fid}.npz"
                 if os.path.exists(_fp):
-                    _z = np.load(_fp); _idx = np.load(p)["ep_idx"]
-                    _base = _z["fp_arrival"][_idx]                    # prior at those endpoints
+                    _base = np.load(_fp)["fp_arrival"][np.load(p)["ep_idx"]]
                     _v = _v - _base                                   # -> DELTA
             es.append(_v)
     es = np.concatenate(es) if es else np.zeros(1, np.float32)
@@ -706,6 +707,14 @@ def load_graph(flow_id, device="cpu"):
     _fa = np.load(f"{ROOT}/cache/fp_arrival/{flow_id}.npz")
     fp_arr = _fa["fp_arrival"][keep].astype(np.float32)
     fp_msk = _fa["mask"][keep]
+    # c = required_time - clock_period: the STRUCTURAL part of the required time (capture flop's
+    # setup, clock uncertainty). MEASURED: `arrival = clock_period - slack` is WRONG by a median
+    # of 0.2735 ns because required_time != clock_period (it spans 2.537..3.123 at T=3.0). The
+    # identity is arrival = required - slack = (T + c) - slack, exact to 0.0003 ns.
+    # c is STRUCTURAL — per-endpoint std across knob configs 0.019-0.035 ns vs a 0.109-0.208 ns
+    # spread ACROSS endpoints (~9x) — so the KNOB still enters by pure arithmetic. c is cached
+    # from the FLOORPLAN stage (leak-free), exactly like the arrival prior.
+    fp_req = _fa["req_offset"][keep].astype(np.float32)
     ep = np.load(f"{ROOT}/cache/endpt/{flow_id}.npz")
     y_ep = np.zeros(g["n_cells"], np.float32); mask = np.zeros(g["n_cells"], bool)
     ep_idx = np.empty(0, np.int64)
@@ -726,7 +735,9 @@ def load_graph(flow_id, device="cpu"):
         # 0.191 (ac97 / usb_funct / sasc / systemcdes) — arrival is up to 18x more stable.
         # Our slack head scores pooled R2 -0.508; this is the likeliest reason.
         if ENDPT_TARGET in ("arrival", "delta"):
-            raw = float(m.clock_period) - raw                 # arrival = require_time - slack
+            # arrival = required - slack = (T + c) - slack.  NOT T - slack: that was wrong by a
+            # median 0.2735 ns (required_time carries setup + uncertainty). See fp_req above.
+            raw = (float(m.clock_period) + fp_req) - raw
         if ENDPT_TARGET == "delta":
             raw = raw - fp_arr                                # Delta on the FREE floorplan prior
         y_ep[ep_idx] = (raw[ep_idx] - nm[f"y_endpt_m"]) / nm[f"y_endpt_s"]
@@ -734,6 +745,7 @@ def load_graph(flow_id, device="cpu"):
     g["y_endpt"] = t(y_ep); g["m_endpt"] = t(mask, torch.bool)
     g["ep_idx"] = torch.tensor(ep_idx, dtype=torch.long)         # labeled endpoint cells
     g["fp_arr_ep"] = t(fp_arr[ep_idx]) if len(ep_idx) else t(np.zeros(0, np.float32))
+    g["fp_req_ep"] = t(fp_req[ep_idx]) if len(ep_idx) else t(np.zeros(0, np.float32))
     # per-cell PLACEMENT GEOMETRY targets: normalized (x, y) in [0,1] at place_resized.
     # Stored full-length (aligned to cell_names) like cache/cts, so [keep] compacts them the
     # same way every other per-cell array is compacted. NOT standardized: the target is already

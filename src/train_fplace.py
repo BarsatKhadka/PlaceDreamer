@@ -242,10 +242,15 @@ def evaluate(model, flows):
             # arithmetic, never through the network:
             #   slack  : as-is                     arrival: slack = T - arrival
             #   delta  : arrival = fp_prior + delta ; slack = T - arrival
+            # invert the head's target back to SLACK. The knob enters ONLY here, by arithmetic:
+            #     slack = required - arrival = (T + c) - arrival
+            # c = fp_req_ep is the per-endpoint STRUCTURAL required-time offset (cached from the
+            # floorplan stage). Using T alone was wrong by a median of 0.2735 ns.
+            req = g["clock_period_raw"] + g["fp_req_ep"].cpu().numpy()
             if fplace.ENDPT_TARGET == "delta":
-                slk = g["clock_period_raw"] - (g["fp_arr_ep"].cpu().numpy() + pred)
+                slk = req - (g["fp_arr_ep"].cpu().numpy() + pred)
             elif fplace.ENDPT_TARGET == "arrival":
-                slk = g["clock_period_raw"] - pred
+                slk = req - pred
             else:
                 slk = pred
             wns_p, tns_p = float(slk.min()), float(slk[slk<0].sum())
