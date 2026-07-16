@@ -156,8 +156,11 @@ def wloss(out, g, nll=True):
     # absolute terms so their sum reproduces the true total. Ranking alone does not (per-net AUC
     # 0.912 but 43.7% absolute rel-err). Measured on a 182-flow probe: the composed sum holds
     # ~15-20% rel-err while the pooled head diverges to 170%.
-    if "tot_hpwl_sum" in out and "y_tot_hpwl" in g:
-        L = L + W["hpwl_sum"] * (out["tot_hpwl_sum"] - g["y_tot_hpwl"]) ** 2
+    # Target the sum over OUR OWN nets — a TRUE identity — NOT meta.total_hpwl, which sums over
+    # 711 buffer-inserted nets that do not exist in our floorplan graph (up to 23% of the total).
+    # Targeting meta.total_hpwl would bias every per-net prediction up 13-30%. See fplace.load_graph.
+    if "tot_hpwl_sum" in out and np.isfinite(g.get("y_hpwl_sum", np.nan)):
+        L = L + W["hpwl_sum"] * (out["tot_hpwl_sum"] - float(g["y_hpwl_sum"])) ** 2
     # per-VN bounding box (xmin,ymin,xmax,ymax) — the well-posed geometry target.
     if fplace.GEO_HEADS and "y_vnbox" in g and g["m_vnbox"].any():
         for i in range(4):

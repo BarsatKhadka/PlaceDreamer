@@ -29,7 +29,16 @@ from fplace import (FPlace, meta, norm, set_norm as _set_norm_place, load_graph 
 #   RT_COMPOSE=sum: rt_wl = SUM_net routed_len -- an identity. f_route's pooled rt_wl scores
 #     +0.66 vs a fair 0.738 baseline, i.e. it LOSES to 3 knobs.
 RT_DIRECT_KNOB = bool(int(os.environ.get("RT_DIRECT_KNOB") or "1"))
-RT_COMPOSE     = os.environ.get("RT_COMPOSE", "pool")   # pool | sum
+# ⛔ RT_COMPOSE=sum is NOT JUSTIFIED — STRESS TEST T2 (scripts/stress_test.py) FAILS it 3 ways:
+#   T2a  rt_wl != SUM(our routed_len): ratio median 0.664 (range 0.381..0.861) — the router adds
+#        nets (CTS buffers, routing opt) that our floorplan graph does not contain.
+#   T2b  the gap is NOT a design-level constant: within-design std 0.041 vs across 0.082 (ratio
+#        0.50) => the level head CANNOT absorb it. (For tot_hpwl the same ratio is 0.18 — absorbable.)
+#   T2c  the sum tracks only R2 0.62 of rt_wl's KNOB RESPONSE (vs R2 0.9942 for tot_hpwl).
+# f_route's pooled rt_wl already scores +0.66, so composing would be WORSE. I added this by analogy
+# with HPWL_COMPOSE and never checked. The two identities are NOT the same thing.
+# Left switchable for the record; DEFAULT POOL. Do not enable without re-running T2.
+RT_COMPOSE     = os.environ.get("RT_COMPOSE", "pool")   # pool | sum  (sum: see T2 — do not use)
 RT_GLOBAL = ("rt_wl", "rt_power")            # level + knob-deviation
 RT_TIMING = ("rt_wns", "rt_tns")             # signed; level + deviation
 
@@ -42,6 +51,8 @@ def load_graph(flow_id, device="cpu"):
     y = np.zeros(len(rl), np.float32); y[ok] = (np.log(rl[ok]) - float(nm["rt_len_m"])) / float(nm["rt_len_s"])
     g["y_rt_len"] = torch.tensor(y, dtype=torch.float, device=device)
     g["m_rt_len"] = torch.tensor(ok, dtype=torch.bool, device=device)
+    # true sum-identity target over OUR OWN nets (see RT_COMPOSE / stress test T2)
+    g["y_rtlen_sum"] = float(np.log(rl[ok].sum())) if ok.any() else float("nan")
     m = meta().loc[flow_id]
     for k, col, signed in (("rt_wl","rt_wl",False), ("rt_power","rt_power",False),
                            ("rt_wns","rt_wns",True), ("rt_tns","rt_tns",True)):

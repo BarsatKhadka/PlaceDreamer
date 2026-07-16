@@ -22,8 +22,10 @@ def wloss(o,g):
     # ANALYTIC COMPOSITION: supervise rt_wl = SUM_net routed_len (RT_COMPOSE=sum).
     # Plain MSE in log space — its job is to CALIBRATE the per-net predictions in
     # ABSOLUTE terms so their sum reproduces the true total. Good ranking alone does not.
-    if "rt_wl_sum" in o and np.isfinite(g.get("y_rt_wl", np.nan)):
-        L = L + W_RT_SUM*(o["rt_wl_sum"] - float(g["y_rt_wl"]))**2
+    # If enabled at all (see RT_COMPOSE — T2 says do not), target the sum over OUR OWN nets,
+    # never meta.rt_wl, which sums router-added nets our graph does not have (ratio 0.664).
+    if "rt_wl_sum" in o and np.isfinite(g.get("y_rtlen_sum", np.nan)):
+        L = L + W_RT_SUM*(o["rt_wl_sum"] - float(g["y_rtlen_sum"]))**2
     for k in ALL:
         if g[f"deg_{k}"]: continue
         L=L+gnll(o[f"{k}_lvl"],g[f"y_{k}_lvl"])+W_DEV*gnll(o[f"{k}_dev"],g[f"y_{k}_dev"])

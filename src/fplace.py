@@ -711,6 +711,21 @@ def load_graph(flow_id, device="cpu"):
         mvn[p] = True
     g["y_vnbox"] = t(box); g["m_vnbox"] = t(mvn, torch.bool)   # [nvn,4] = xmin,ymin,xmax,ymax
     # raw recorded WNS/TNS — for eval readout comparison (complete, untruncated)
+    # TRUE SUM-IDENTITY TARGET for HPWL_COMPOSE=sum.
+    # STRESS TEST (scripts/stress_test.py T1): meta.total_hpwl is the sum at GLOBAL_PLACE over
+    # 21,517 nets, but our graph is FLOORPLAN with 20,806 — the 711 extra nets are created DURING
+    # placement by the resizer's buffer insertion, and they carry up to 23% of the total (ethernet
+    # ratio 0.772; ac97 0.850; sasc 1.000 — small designs get no buffers).
+    # So `tot_hpwl = SUM_net HPWL_net` is NOT an identity over OUR nets, and supervising the
+    # composed sum against meta.total_hpwl would inflate every per-net prediction by 13-30% to
+    # close a gap the net head did not cause — DAMAGING our best head (AUC 0.912).
+    # The gap is a DESIGN-LEVEL CONSTANT (within-design std 0.0103 vs across-design 0.0567 =>
+    # ratio 0.18), and the knob response survives it: corr(dev log SUM(ours), dev log meta) =
+    # +0.9936 (R2 0.9872, 648 flows / 18 designs). So: supervise the sum against the sum over OUR
+    # OWN nets — a TRUE identity — and let the level head carry the buffer-net offset.
+    _nh = np.asarray(d["net_hpwl"], np.float64)
+    _ok = np.isfinite(_nh) & (_nh > 0)
+    g["y_hpwl_sum"] = float(np.log(_nh[_ok].sum())) if _ok.any() else float("nan")
     g["wns_true"] = float(m.wns); g["tns_true"] = float(m.tns)
     g["clock_period_raw"] = float(m.clock_period)   # for the arrival->slack identity
     return {k: (v.to(device) if torch.is_tensor(v) else v) for k, v in g.items()}
