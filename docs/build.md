@@ -285,8 +285,17 @@ plain concat by 12-19% RMSE. (Caveat: their eval is within-design across knobs.)
 **Nobody publishes cross-design absolute per-net HPWL error.** Net²'s full text has ZERO
 MAE/RMSE/MAPE. They report top-10%-longest-net **ROC-AUC (92.2)** and a **20-bin correlation
 (0.98, with the top 5% of nets EXCLUDED)** — binning cancels per-net error.
-**Net², MacroRank and Huang (DATE'19) ALL independently abandoned absolute regression for ranking.**
-Three SOTA papers doing that is the field telling us something.
+~~**Net², MacroRank and Huang (DATE'19) ALL independently abandoned absolute regression for
+ranking.**~~ **RETRACTED 2026-07-16 — verified FALSE from the Net2 PDF.** Net2 *regresses* net
+length: *"The net length is the label for training and prediction. Each net's length is the HPWL of
+the bounding box of the net after placement."* There is no ranking loss. What is TRUE: Net2 never
+publishes a um-level absolute error — it reports only binned correlation (>0.98) and top-10% AUC
+(**92.2** for nets; their 92.5 is for PATHS), and calls the binned protocol "a classical criterion
+used in many net length estimation works". So the FIELD evaluates this ORDINALLY — a convention,
+not an impossibility proof. MacroRank's stated reason is decision-theoretic, not
+under-determination: *"the relative relationship between them is noteworthy instead of the absolute
+value ... a ranking model, rather than a regression model, is needed"*, and they show the
+dissociation (EHNN has the best MRE but ~0 Kendall tau until the loss is swapped).
 
 Cross-design reference points:
   - DE-HNN cross-design per-net log2 RMSE 1.677 (Pearson 0.754) => ~3.2x multiplicative tail error
@@ -298,9 +307,17 @@ Cross-design reference points:
    anyone else is willing to report.** We are not an outlier.
 
 ### 8. The ceiling (stated, not guessed)
-Per-net absolute HPWL from a pre-placement netlist is **fundamentally under-determined** — Net²'s
-725-net example is a proof by construction. Length is set by GLOBAL placement pressure.
-**Consensus: ranking works (AUC ~92); absolute per-net regression does not.**
+~~Per-net absolute HPWL from a pre-placement netlist is **fundamentally under-determined** — Net²'s
+725-net example is a proof by construction.~~ **PARTIALLY RETRACTED 2026-07-16.** The 725 nets
+(identical local features, lengths 1um..100um, design B20) are REAL — but **Net2 uses them to argue
+for a GLOBAL RECEPTIVE FIELD, not to drop regression** (Net2a's fix is an edge-convolution reaching
+the whole netlist). The honest statement: the field evaluates net length ordinally by convention
+and does not publish absolute error; that is not the same as proving regression impossible.
+NOTE the contrast with PLACEMENT GEOMETRY, where under-determination IS established:
+absolute per-cell POSITION has a genuine gauge freedom (placement is a global optimisation), our
+NLL head provably converged to the die-centre baseline (0.397 vs 0.395), and TransPlace's own
+Table 11 shows their geometry head alone is 25,753x worse on overflow without a gradient
+fine-tuner. Position: under-determined. Net length: merely evaluated ordinally.
 => ADDED top-10% AUC / recall@10% / 20-bin correlation to evaluate(). f_route needs to know WHICH
 nets are long and congested, not their exact length — that is a ranking problem, and it is the
 achievable one.

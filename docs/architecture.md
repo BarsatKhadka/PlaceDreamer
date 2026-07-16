@@ -2,6 +2,20 @@
 
 *Living doc. We decide step by step, one choice at a time.*
 
+> **THIS FILE = the SYSTEM** (pipeline, agent, MBPO training, grounding loop, decision log).
+> **[`docs/model_architecture.md`](model_architecture.md) = the MODEL** (encoder, heads, state,
+> identities, the seam) — rewritten 2026-07-16 from papers read IN SOURCE (DE-HNN, Net2, TimingGCN,
+> MasterRTL, RTL-Timer, TransPlace, MacroRank) and stress-tested against the real data.
+> **[`learning.md`](../learning.md)** = the evidence log (MEASURED / CITED / HYPOTHESIS + 7
+> retractions). **[`scripts/stress_test.py`](../scripts/stress_test.py)** = this file's ground rule,
+> executable.
+>
+> **The headline that changes this document:** the flow is **ONE STATE (arrival, length, power,
+> area) propagated**, and **PPA is a READOUT of that state, not a prediction**. The PPA identities
+> are verified EXACT (area ratio 1.0000; power 0.09%; `wns == min(T − arrival)` to 0.00e+00). A
+> **zero-parameter copy of the floorplan arrival beats our trained timing head by +0.98 R²** — we
+> predict from scratch what the input already tells us. See `model_architecture.md` §1–§3.
+
 **Ground rule: no claim is DECIDED until it's confirmed against real runs.** No assuming.
 When we reach a decision, we open the actual archived data, check the claim, and only then
 write it down. Every number and shape in this doc must be traceable to something we looked at.
@@ -139,9 +153,17 @@ limited — cross-design congestion tops out ~0.37 Pearson for *all* models (DE-
 logically-null netlist/floorplan changes swing routed WL ±7–11% (Chan/Kahng noise floor). Our
 setting is cross-design (leave-one-design-out), so expect this. Two responses: (1) **knob
 conditioning** attacks the source (it fixes *which* placement is realized → less
-under-determined — Net² gets ~0.98 with a fixed flow); (2) **predict uncertainty**
+under-determined); (2) **predict uncertainty**
 (distribution/quantiles or seed-ensemble), don't output a false-precision point estimate.
-*(Numbers above are from a survey — verify against the DE-HNN results tables before quoting.)*
+
+> **VERIFIED 2026-07-16 (this was the flagged "verify before quoting" — now done, from the PDFs):**
+> Net2's "~0.98" is its **20-BIN CORRELATION** (bin by true length, top 5% EXCLUDED, correlate bin
+> means) — **not** an absolute-accuracy number. Its net AUC is **92.2** (92.5 is for PATHS). Net2
+> **does regress** net length; it simply never publishes a um-level error.
+> Our own numbers on the same axes: **AUC 0.912**, 20-bin r **0.956**, absolute rel-err **43.7%**.
+> Also verified: **DE-HNN's own cross-design script has val == test** (`load_data_indices[10:]`
+> twice) and selects checkpoints on **training** loss, with per-design z-scored targets — so its
+> "cross-design" numbers never test level transfer. **Do not calibrate against them.**
 
 ## 2.5 f_cts  (placement state + CTS knobs → post-CTS state)  — LATER
 *Deferred. The clock-tree stage; slots between place and route once the 2-stage core works.*
