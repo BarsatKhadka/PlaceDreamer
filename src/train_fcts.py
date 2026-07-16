@@ -7,11 +7,15 @@ import numpy as np, torch
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import fcts
 from fcts import FCTS, load_graph, set_norm, recon, CTS_GLOBAL, CTS_TIMING
-from fplace import gnll, norm
+from fplace import gnll, norm, FPlace
 import train_fplace as TF          # reuse make_folds, SIZE_ANCHORS, OOD, flows_of
 
 E = os.environ.get
 DEV    = "cuda" if torch.cuda.is_available() else "cpu"
+# THE SEAM. "" = standalone; "real" = teacher-forced (real placement state); "imagined" = consume
+# f_place's prediction (needs FPLACE_CKPT). We run "real" FIRST — it's the compounding baseline.
+SEAM_MODE  = E("SEAM_MODE", "") or None
+FPLACE_CKPT = E("FPLACE_CKPT", "")   # required for SEAM_MODE=imagined (a trained f_place fold.pt)
 EPOCHS = int(E("EPOCHS", 200)); LR = float(E("LR", 1e-3))
 DIM    = int(E("DIM", 64)); LAYERS = int(E("LAYERS", 4)); ACCUM = int(E("ACCUM", 8))
 SEED   = int(E("SEED", 0)); ENCODER = E("ENCODER", "dehnn")
@@ -45,8 +49,14 @@ def evaluate(model, flows):
         p, t = np.array(P[k]), np.array(T[k]); ok = np.isfinite(p) & np.isfinite(t)
         if ok.sum() < 3: continue
         p, t = p[ok], t[ok]
+        # real units: buffers/power are log -> exp; wns/tns are signed-log -> inverse
+        if k in ("cts_wns", "cts_tns"):
+            rp, rt = np.sign(p)*np.expm1(np.abs(p)), np.sign(t)*np.expm1(np.abs(t))
+        else:
+            rp, rt = np.exp(p), np.exp(t)
         d = dict(n=int(ok.sum()),
-                 med_rel=float(np.median(np.abs(np.expm1(p - t)))),   # log-space -> rel err
+                 med_ae=float(np.median(np.abs(rp - rt))),            # REAL units (buffers/W/ns)
+                 med_rel=float(np.median(np.abs(np.expm1(p - t)))),
                  abs_r2=float(1 - ((t-p)**2).sum()/((t-t.mean())**2).sum()))
         pd_, td_ = np.array(Pd[k]), np.array(Td[k])
         if len(td_) >= 3 and td_.std() > 1e-9:
@@ -60,9 +70,16 @@ def run_fold(fi, test_designs, dev):
     val_d, train_d = sorted(shf[:2]), sorted(shf[2:] + TF.SIZE_ANCHORS)
     tr, val, te = TF.flows_of(train_d), TF.flows_of(val_d), TF.flows_of(test_designs)
     rng = random.Random(SEED); rng.shuffle(tr)
-    print(f"\n=== fold {fi}: test {test_designs}", flush=True)
+    print(f"\n=== fold {fi}: test {test_designs}  SEAM={SEAM_MODE}", flush=True)
     print(f"    train {len(tr)} flows/{len(train_d)} designs | val {len(val_d)} | test {test_designs}", flush=True)
-    set_norm(train_d)
+    set_norm(train_d)                          # norm must exist before the seam builds place_state
+    # SEAM: activate the placement-state input. 'real' = teacher-forced; 'imagined' = f_place ckpt.
+    place_model = None
+    if SEAM_MODE == "imagined":
+        place_model = FPlace(d=DIM, K=LAYERS, encoder=ENCODER).to(DEV)
+        place_model.load_state_dict(torch.load(f"{FPLACE_CKPT}/fold{fi}.pt", map_location=DEV))
+        place_model.eval()
+    fcts.set_seam(SEAM_MODE, place_model)
     model = FCTS(d=DIM, K=LAYERS, encoder=ENCODER).to(DEV)
     opt = torch.optim.Adam(model.parameters(), lr=LR)
     sched = torch.optim.lr_scheduler.ReduceLROnPlateau(opt, mode="max", factor=0.5, patience=10, min_lr=1e-5)
@@ -81,10 +98,10 @@ def run_fold(fi, test_designs, dev):
         if score > best + 1e-4:
             best = score; best_state = {k: x.detach().cpu().clone() for k, x in model.state_dict().items()}
         g_ = lambda k, s: v[k].get(s, float("nan")) if k in v else float("nan")
-        print(f"  ep {ep:3d} tr {tot/len(tr):7.3f} | VAL knob-R²: buf {g_('cts_buffers','knob_r2'):+.3f} "
-              f"pow {g_('cts_power','knob_r2'):+.3f} wns {g_('cts_wns','knob_r2'):+.3f} | "
-              f"rel-err buf {g_('cts_buffers','med_rel')*100:.0f}% pow {g_('cts_power','med_rel')*100:.0f}% "
-              f"| lr {opt.param_groups[0]['lr']:.1e} ({time.time()-t0:.0f}s)", flush=True)
+        print(f"  ep {ep:3d} tr {tot/len(tr):7.3f} | VAL abs-err: buf {g_('cts_buffers','med_ae'):6.1f}cells "
+              f"pow {g_('cts_power','med_ae'):9.0f}W wns {g_('cts_wns','med_ae'):.3f}ns tns {g_('cts_tns','med_ae'):8.1f}ns "
+              f"| knob-R2: buf {g_('cts_buffers','knob_r2'):+.2f} pow {g_('cts_power','knob_r2'):+.2f} "
+              f"wns {g_('cts_wns','knob_r2'):+.2f} | lr {opt.param_groups[0]['lr']:.1e} ({time.time()-t0:.0f}s)", flush=True)
     if best_state: model.load_state_dict(best_state)
     torch.save(model.state_dict(), f"{OUT}/fold{fi}.pt")
     res = evaluate(model, te)
