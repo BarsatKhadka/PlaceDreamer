@@ -62,7 +62,7 @@ FOLD=$((I % 3))
 
 NG=$(ls cache/graphs/*.npz 2>/dev/null | wc -l)
 if [ "$NG" -eq 0 ]; then echo "FATAL: cache/graphs is empty." >&2; exit 1; fi
-for C in coords fp_arrival; do
+for C in coords fp_arrival net_family; do
   NC=$(ls cache/$C/*.npz 2>/dev/null | wc -l)
   if [ "$NC" -ne "$NG" ]; then
     echo "FATAL: cache/$C has ${NC} flows, cache/graphs has ${NG}. Run: git pull" >&2; exit 1

@@ -51,6 +51,11 @@ export FOLD=$((IDX % 3))
 export ENCODER=dehnn
 export OUT="runs/aggr_${AGGR}"
 
+# STAGE 1/2: hold the input-encoder fusion at the OLD behaviour (sum) so this
+# ablation measures ONLY the encoder/aggregator. FUSE is measured in STAGE 3,
+# against whatever wins here. One variable at a time.
+export FUSE=sum
+
 python -c "import torch; assert torch.cuda.is_available(), 'CUDA NOT VISIBLE'; print('GPU:', torch.cuda.get_device_name(0))"
 echo "=== task ${IDX}: AGGR=${AGGR}  FOLD=${FOLD}  ->  ${OUT} ==="
 python src/train_fplace.py

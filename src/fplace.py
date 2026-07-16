@@ -68,7 +68,7 @@ SUPER_VN = bool(int(os.environ.get("SUPER_VN") or "0"))
 # NOTE: DE-HNN uses NEITHER sum NOR mean. They use gcn_norm-weighted sum
 # (train_all_cross.py:85-87): each edge weighted 1/sqrt(deg_i*deg_j). AGGR=gcn is that.
 # bump when set_norm's CONTENT changes (new keys/stats) so stale caches invalidate
-NORM_VERSION = 4   # +geometry feats, +wns_g/tns_g targets, +crit_path knob
+NORM_VERSION = 5   # +NET_TARGET=family (rollup changes y_net_hpwl -> new mean/std)
 N_TYPES = 442            # 441 real cell types + 1 UNK slot (index 441)
 UNK_TYPE = 441
 
@@ -140,6 +140,15 @@ TARGETS        = LOG_TARGETS
 #               fixed multiple of designs — the currency we lack at n=18) and PowPrediCT's
 #               (DAC'24), whose loss LITERALLY blends model residual with an early-stage feature:
 #                   swi_p = (model/scale)*res_portion + early_feature*early_mult*early_portion
+# NET-FAMILY ROLLUP (scripts/add_net_family.py). "own" = each net's own HPWL, split nets thrown
+# away by cache/netmask. "family" = the net's HPWL PLUS its descendants' — the buffers that split
+# it. MEASURED at LABEL_STAGE=global_place: Sigma(families)/true = 1.000000 on every one of 1944
+# flows => tot_hpwl = Sigma_i fam_hpwl(i) is a TRUE IDENTITY over our FIXED floorplan node set, so
+# HPWL_COMPOSE=sum becomes exact instead of approximate (it was 0.68..0.82 before).
+# It also RETIRES the netmask: that mask discards 0.39% of nets carrying 4-6% of HPWL at a median
+# 20x the rest — the highest-leverage nets in our best head (AUC 0.912). The rollup explains
+# 323/323 = 100% of them. Fix the cause, don't delete the symptom. See add_net_family.py.
+NET_TARGET   = os.environ.get("NET_TARGET", "own")       # own | family
 ENDPT_TARGET = os.environ.get("ENDPT_TARGET", "slack")   # slack | arrival | delta
 WNS_HEAD = bool(int(os.environ.get("WNS_HEAD") or "1"))
 # A/B FLAG. crit_path = clock_period - fp_wns = the design TIMING SCALE theta(G_D).
@@ -403,7 +412,16 @@ def set_norm(train_designs, force=False):
             nx.append(_pre(_netfeat(d, os.path.basename(p)[:-4]), LOG_NET)); df.append(_pre(_dffeat(d), LOG_DF))
         for p in fl[::11][:10]:                             # per-net targets DO move with knobs
             d = np.load(p, allow_pickle=True)
-            a = d["net_hpwl"];   ynh.append(np.log(a[np.isfinite(a) & (a > 0)]))
+            # NET_TARGET=family standardizes against the ROLLED-UP label, not the net's own. They
+            # are different distributions (a family's HPWL >= its head net's), so reusing the "own"
+            # stats would hand the head a target that is not ~N(0,1) — the exact failure that made
+            # tot_hpwl swamp the gradient before targets were standardized at all.
+            if NET_TARGET == "family":
+                z = np.load(f"{ROOT}/cache/net_family/{os.path.basename(p)[:-4]}.npz")
+                a = np.where(z["fam_mask"], z["fam_hpwl"], np.nan)
+            else:
+                a = d["net_hpwl"]
+            ynh.append(np.log(a[np.isfinite(a) & (a > 0)]))
     cx, nx, df = np.concatenate(cx), np.concatenate(nx), np.stack(df)
     cx_m, cx_s, cx_d = _stats(cx, IDENT_CELL)
     nx_m, nx_s, nx_d = _stats(nx, IDENT_NET)
@@ -595,6 +613,21 @@ def load_graph(flow_id, device="cpu"):
     # +0.98 R2 (T7b) depends on the model SEEING arrival_floorplan, not just being scored on the
     # delta. 2 dims: [z(fp_arrival), has_fp_arrival]. Inserted into the LIBRARY block BEFORE the
     # PE dims, exactly as f_cts inserts its CTS features, so SignNet still sees the last 10 as PE.
+    # ---- PER-NET TARGET. "own" = this net's HPWL, with cache/netmask DISCARDING split nets.
+    # "family" = this net PLUS its descendants (the buffers that split it), so nothing is discarded
+    # and Sigma_i fam_hpwl(i) == the true total EXACTLY (1.000000 on all 1944 flows, global_place).
+    # THE MASK IS DELIBERATELY NOT APPLIED IN family MODE. netmask exists to hide the split-label
+    # bug by dropping 0.39% of nets that carry 4-6% of HPWL at 20x the median length; the rollup
+    # FIXES those same 323/323 nets. Re-masking would throw away exactly what this recovers.
+    if NET_TARGET == "family":
+        _nf = np.load(f"{ROOT}/cache/net_family/{flow_id}.npz")
+        _nh_target = _nf["fam_hpwl"].astype(np.float32)
+        _nh_mask   = _nf["fam_mask"] & np.isfinite(_nh_target) & (_nh_target > 0)
+    else:
+        _nh_target = d["net_hpwl"]
+        _nh_mask   = (np.isfinite(_nh_target) & (_nh_target > 0)
+                      & np.load(f"{ROOT}/cache/netmask/{flow_id}.npz")["label_ok"])
+
     _fa2 = np.load(f"{ROOT}/cache/fp_arrival/{flow_id}.npz")
     _fv, _fm = _fa2["fp_arrival"][keep].astype(np.float32), _fa2["mask"][keep]
     _fz = np.where(_fm, (_fv - nm["fpa_m"]) / nm["fpa_s"], 0.0).astype(np.float32)
@@ -663,14 +696,13 @@ def load_graph(flow_id, device="cpu"):
         ntc=torch.cat([ed.flip(0), es.flip(0)], 1),                    # net→cell [net; cell]
         # all targets: log space, then STANDARDIZED with train-fold stats -> ~N(0,1).
         # (raw log-means span 2.4..11.2; unstandardized, tot_hpwl swamps the gradient.)
-        y_net_hpwl=_z("net_hpwl", torch.log(t(d["net_hpwl"]).clamp(min=1e-6))),
+        y_net_hpwl=_z("net_hpwl", torch.log(t(_nh_target).clamp(min=1e-6))),
         # mask = finite AND positive AND the label is TRUSTWORTHY. The graph is @floorplan but
         # labels are @global_place; buffer insertion SPLITS high-fanout nets in between, and the
         # name survives so name-matching silently attached a FRAGMENT's HPWL to the full net.
         # 0.41% of nets — but they carry 4-6% of total HPWL, median 20x the rest, i.e. exactly
         # the highest-leverage nets in the per-net head. cache/netmask marks them. (audit B2)
-        m_net_hpwl=t(np.isfinite(d["net_hpwl"]) & (d["net_hpwl"] > 0)
-                     & np.load(f"{ROOT}/cache/netmask/{flow_id}.npz")["label_ok"], torch.bool),
+        m_net_hpwl=t(_nh_mask, torch.bool),
         has_bufcnt=bool(np.isfinite(bufcnt)),
     )
     # GLOBAL targets, DECOMPOSED (see set_norm): log(y) = design_level + knob_deviation.
@@ -787,8 +819,15 @@ def load_graph(flow_id, device="cpu"):
     # ratio 0.18), and the knob response survives it: corr(dev log SUM(ours), dev log meta) =
     # +0.9936 (R2 0.9872, 648 flows / 18 designs). So: supervise the sum against the sum over OUR
     # OWN nets — a TRUE identity — and let the level head carry the buffer-net offset.
-    _nh = np.asarray(d["net_hpwl"], np.float64)
-    _ok = np.isfinite(_nh) & (_nh > 0)
+    # *** NET_TARGET=family PROMOTES THIS. *** The retreat above was forced by the gap; the rollup
+    # REMOVES the gap. MEASURED, Sigma(fam_hpwl) / meta.total_hpwl, one row per flow:
+    #     ac97 1.000000  sasc 1.000000  usb_funct 1.000000  ethernet 1.000000  tv80 1.000000
+    #     des3_area 1.000000  jpeg 1.000000  spi 1.000000        (own: median 0.8963)
+    # So in family mode tot_hpwl = Sigma_i fam_hpwl(i) IS meta.total_hpwl, exactly, over our FIXED
+    # floorplan nets. T1's FAIL becomes a PASS and we supervise the REAL total, not a proxy —
+    # no 13-30% inflation risk, because there is no longer a gap to close.
+    _nh = np.asarray(_nh_target, np.float64)
+    _ok = np.asarray(_nh_mask, bool)
     g["y_hpwl_sum"] = float(np.log(_nh[_ok].sum())) if _ok.any() else float("nan")
     g["wns_true"] = float(m.wns); g["tns_true"] = float(m.tns)
     g["clock_period_raw"] = float(m.clock_period)   # for the arrival->slack identity
