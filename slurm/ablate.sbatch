@@ -54,19 +54,29 @@
 # diverged to 112.7%. Theory agrees the failure is aggregation, not representation: tot_hpwl is a
 # sum of LOCAL quantities, inside the 1-WL class (Xu GIN ICLR'19; Chen NeurIPS'20 Cor 3.4).
 #
-# cfg 3 now measures whether MY OWN GEOMETRY WORK **HURTS**, and I expect it does.
-# The geometry heads were UNGATED — training in every arm of the first launch, including base —
-# and they are MEASURED DEAD at FULL scale: "GEO skill" is negative every epoch (box -0.001..
-# -0.062, pos -0.064..-0.172, d=64/K=4, 756 flows). Yet W_POS=5 (x2 terms) + W_VNBOX=5 (x4 terms)
-# made them **68.2% OF THE ENTIRE LOSS**, while net_hpwl — the head that WORKS (AUC 0.912) — got
-# 11.4%. They share the encoder, so they were shaping the representation toward a task that does
-# not learn. GEO_HEADS now defaults OFF (-134k params); cfg 3 turns the whole lot back on
-# (heads + die_area/sqrt(nA) feats + crit_path knob).
-#   cfg 3 WORSE than base  => my geometry work was actively harmful; DELETE it.
-#   cfg 3 == base          => it was merely useless; DELETE it anyway.
-# Either way it goes. This arm exists to price the damage, not to rescue the idea.
-# NOTE: this is why the first launch had to be killed — with the heads ungated, cfg 0 was NOT the
-# shipped model (which had no geometry heads), so the control could not validate anything.
+# cfg 3 = CAN WE PREDICT GEOMETRY AT ALL? This is NOT a throwaway arm — CTS NEEDS it.
+# In the SwiftCTS data (CTS knobs varied, unlike EDA-Schema) placement adds +0.124 to
+# clock_buffers, so the seam is only load-bearing if f_place can emit geometry. If we cannot
+# predict pos/vn_box, the whole f_place -> f_cts seam has nothing real to carry.
+#
+# Why the first launch had to be killed: the geometry losses were gated by `if "y_pos_x" in g`
+# (ALWAYS TRUE), not by a flag — so they trained in EVERY arm including base, meaning cfg 0 was
+# NOT the shipped model (which has no geometry heads) and the control validated nothing.
+# And W_POS=5 / W_VNBOX=5 — numbers I picked with NO justification — made geometry 68.2% OF THE
+# WHOLE LOSS while net_hpwl (AUC 0.912, the head that works) got 11.4%.
+# Now W_POS=1 / W_VNBOX=0.5 -> geometry 22.2%, net_hpwl 27.8%. It can learn without steering
+# the encoder.
+#
+# Read "GEO skill" (1 - err/trivial-baseline) OVER THE FULL 200 EPOCHS:
+#   skill > 0 by ep 200  => geometry IS learnable -> the seam can carry real placement state.
+#   skill <= 0 at ep 200 => this FORMULATION fails, and the literature says why: NOBODY does
+#       plain L2 on absolute cross-design coordinates. Every group that generates coordinates
+#       uses a distributional objective (GraphPlanner VAE'22 -> diffusion ICML'25 -> flow'26),
+#       and TransPlace's worked answer is to predict RELATIVE (rho, dtheta) and decode from
+#       FIXED I/O PADS. Anchor, do not canonicalize. That is the next formulation to try —
+#       NOT deletion.
+# (An earlier read of "GEO skill < 0" at EPOCH 26 of 200 was called dead prematurely. It is not
+#  a verdict until the run ends.)
 
 set -euo pipefail
 mkdir -p logs runs
