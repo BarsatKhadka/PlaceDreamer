@@ -8,6 +8,63 @@ measurement on our data or a paper we read *in source*. Where we don't know, it 
 
 ---
 
+## −1. THE WORLD MODEL IS ONE STATE PROPAGATED — not three metric predictors
+
+*This section supersedes the per-stage thinking below. It is the answer to "look at everything as
+one thing."*
+
+### MEASURED — `arrival` exists at EVERY stage, and the identity is EXACT at every one
+`ac97_ctrl-000001`, clock_period 3.0 ns, `slack = required − arrival` **EXACT (≤1 ps) at all six**:
+
+| stage | max arrival | min slack | **Δarrival** |
+|---|---|---|---|
+| **floorplan** | 3.022 | −0.177 | — ← **this is our INPUT. We already have it.** |
+| global_place | 3.031 | −0.215 | +0.009 |
+| **place_resized** | 3.711 | −0.917 | **+0.680** ← the resizer does the work |
+| cts | 3.800 | +0.007 | +0.089 |
+| global_route | 3.672 | +0.100 | **−0.128** ← routing *improves* timing |
+| detailed_route | 3.672 | +0.100 | **+0.000** ← timing is settled at global_route |
+
+### MEASURED — it CHAINS: endpoints are stable
+79.5% of endpoints exist at **every** stage; **consecutive stages share 97.8–100%**.
+Per-endpoint Δarrival (floorplan→place_resized): median **+0.224 ns**, IQR [+0.150, +0.439],
+**corr(fp, placed) = +0.669**.
+
+### 🛑 MEASURED — A ZERO-PARAMETER COPY OF OUR INPUT BEATS OUR TRAINED HEAD BY +0.98 R²
+Fold-0 test designs, `arrival_place := arrival_floorplan + one global shift`:
+
+| | R² |
+|---|---|
+| copy, raw | −2.465 (a systematic offset — placement ADDS delay) |
+| **copy + single global shift** | **+0.476** (ac97 .460 / sasc .500 / systemcdes .834 / usb_funct .112) |
+| **our trained 680k-param `endpt` head** | **−0.508** |
+
+**We predict from scratch what we already know, and do it worse than not predicting.**
+
+### ⇒ THE ARCHITECTURE
+```
+arrival_floorplan  (KNOWN — the input stage. FREE. corr 0.669 with placed.)
+      │  f_place : predict Δarrival  ⇒ arrival_place = arrival_fp + Δ
+      │  f_cts   : predict Δarrival  ⇒ arrival_cts   = arrival_place + Δ
+      │  f_route : predict Δarrival  ⇒ arrival_route = arrival_cts + Δ
+      └─ at EVERY stage:  slack = T − arrival ;  wns = min(slack) ;  tns = Σ min(slack,0)
+                          (identities — verified exact; meta.wns == min(path slack) to 0.00e+00)
+```
+- **The seam carries `arrival`** — per-endpoint, physical, chains at 97.8–100% endpoint overlap.
+  NOT our current bag of (broken slack + one HPWL column + 6 globals).
+- **Every stage has the same target type** (Δarrival), so one head design serves all three.
+- **The knob never enters the network for timing** — it enters via `slack = T − arrival`.
+- **Each stage is a RESIDUAL on a known prior** — Δ-ML's pattern ("pick the prior for smoothness,
+  not accuracy"; the prior buys a persistent offset in the learning curve ≈ a fixed multiple of
+  designs, which is the currency we lack at n=18). RTL-Timer does exactly this: their analytic STA
+  arrival is R=0.26 alone and R=0.86 through the model.
+- **f_route's Δ is ~0 from global_route → detailed_route**, so routing timing is settled earlier
+  than we assumed.
+
+**This is what the seam SHOULD be. Everything in §2.3 below is the mechanism for predicting Δ.**
+
+---
+
 ## 0. The three facts that force everything
 
 **F1 — The input graph is IDENTICAL across a design's 108 knob configs.** (MEASURED: `cell_x`

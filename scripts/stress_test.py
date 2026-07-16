@@ -183,7 +183,44 @@ def T6():
         f"net delay median {dn:.4f} ns vs cell delay {dc:.6f} ns ({dn/max(dc,1e-9):.0f}x). "
         f"So timing is driven by net length — the head we score AUC 0.912 on.")
 
-TESTS = {"T1": T1, "T2": T2, "T3": T3, "T4": T4, "T5": T5, "T6": T6}
+# ---------------------------------------------------------------- T7
+def T7():
+    """is the FLOORPLAN arrival a free prior we throw away? (the seam / Delta-arrival claim)"""
+    import pyarrow.dataset as ds
+    import train_fplace as TF
+    D = f"{fplace.ROOT}/datasets/sky130hd"
+    tp = ds.dataset(f"{D}/timing_paths/table.parquet"); m = fplace.meta()
+    _, folds = TF.make_folds(); test_d = folds[0]
+    def arr(fid, stage):
+        t = tp.to_table(filter=(ds.field("stage") == stage) & (ds.field("flow_id") == fid)
+                        & (ds.field("path_type") == "setup"),
+                        columns=["endpoint", "arrival_time"]).to_pandas()
+        return t.groupby("endpoint").arrival_time.max() if len(t) else None
+    res, ov = [], []
+    for dsg in test_d:
+        fids = [f for f in m.index if f.rsplit("-", 1)[0] == dsg][::12][:8]
+        P, Q = [], []
+        for fid in fids:
+            a0, a1 = arr(fid, "floorplan"), arr(fid, "place_resized")
+            if a0 is None or a1 is None: continue
+            j = a0.to_frame("fp").join(a1.to_frame("pr"), how="inner").dropna()
+            if len(j) < 10: continue
+            P.append(j.fp.values); Q.append(j.pr.values)
+            ov.append(len(j) / max(len(a0), 1))
+        if not P: continue
+        fp, pr = np.concatenate(P), np.concatenate(Q)
+        sh = np.median(pr - fp)
+        res.append(1 - ((pr - (fp + sh)) ** 2).sum() / ((pr - pr.mean()) ** 2).sum())
+    r2 = float(np.mean(res))
+    rec("T7a", "endpoints CHAIN across stages?", "PASS" if np.mean(ov) > 0.7 else "FAIL",
+        f"floorplan->place_resized endpoint overlap {100*np.mean(ov):.1f}%")
+    rec("T7b", "zero-param copy of floorplan arrival beats our trained endpt head?",
+        "FAIL" if r2 > -0.508 else "PASS",
+        f"R2(copy+global shift) = {r2:+.3f} vs our trained head's -0.508 -> the FREE PRIOR beats it "
+        f"by {r2-(-0.508):+.2f} R2. We predict from scratch what we already know. "
+        f"[FAIL here = our architecture is wrong, not the test]")
+
+TESTS = {"T1": T1, "T2": T2, "T3": T3, "T4": T4, "T5": T5, "T6": T6, "T7": T7}
 if __name__ == "__main__":
     want = [a for a in sys.argv[1:] if a in TESTS] or list(TESTS)
     print(f"\n{'='*78}\nSTRESS TEST — architecture.md claims vs the real data\n{'='*78}\n")
