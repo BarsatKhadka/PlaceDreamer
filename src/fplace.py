@@ -129,8 +129,13 @@ TARGETS        = LOG_TARGETS
 #               up to 18x more stable than slack (stress_test T4, arrival wins 6/8 designs).
 #   "delta"   : arrival - arrival_FLOORPLAN. THE ONE THE DATA DEMANDS (stress_test T7b):
 #               a ZERO-PARAMETER copy of the floorplan arrival scores R2 +0.476 while our trained
-#               head scores -0.508 — the FREE PRIOR beats it by +0.98 R2. We were predicting from
-#               scratch what our own input stage already tells us.
+#               head scores -0.508 — the FREE PRIOR beats it by +0.98 R2 ON THE SAME TASK. We were
+#               predicting from scratch what our own input stage already tells us.
+#               ⚠️ SCOPE (stress_test T8): fp_arrival is DESIGN-CONSTANT across knob configs
+#               (median per-cell CV 0.0053; ethernet EXACTLY 0.0000). It is a per-endpoint
+#               STRUCTURAL prior — which endpoints are inherently slow — and carries ZERO knob
+#               response. delta strips the structural baseline; the KNOB response must still come
+#               from knobs x graph (F2). Do NOT claim the prior supplies per-config information.
 #               This is Delta-ML's pattern (a prior buys a persistent learning-curve offset ~ a
 #               fixed multiple of designs — the currency we lack at n=18) and PowPrediCT's
 #               (DAC'24), whose loss LITERALLY blends model residual with an early-stage feature:

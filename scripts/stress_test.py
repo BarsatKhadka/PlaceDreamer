@@ -220,7 +220,35 @@ def T7():
         f"by {r2-(-0.508):+.2f} R2. We predict from scratch what we already know. "
         f"[FAIL here = our architecture is wrong, not the test]")
 
-TESTS = {"T1": T1, "T2": T2, "T3": T3, "T4": T4, "T5": T5, "T6": T6, "T7": T7}
+# ---------------------------------------------------------------- T8
+def T8():
+    """is fp_arrival a per-CONFIG prior, or DESIGN IDENTITY in disguise? (the ENDPT_TARGET=delta claim)"""
+    tot = []
+    for dsg in ["sasc", "ac97_ctrl", "systemcdes", "usb_funct", "ethernet", "pci"]:
+        fl = sorted(glob.glob(f"cache/fp_arrival/{dsg}-*.npz"))[::12][:9]
+        if len(fl) < 3: continue
+        A, M = [], []
+        for p in fl:
+            fid = os.path.basename(p)[:-4]
+            d = np.load(f"cache/graphs/{fid}.npz", allow_pickle=True)   # align on live_cells:
+            keep = fplace.live_cells(d)                                  # raw arrays include
+            z = np.load(p)                                               # tapcells, which VARY
+            A.append(z["fp_arrival"][keep]); M.append(z["mask"][keep])
+        A, M = np.array(A), np.array(M)
+        ok = M.all(0)
+        if ok.sum() < 20: continue
+        X = A[:, ok]
+        tot.append(float(np.median(X.std(0) / (np.abs(X.mean(0)) + 1e-9))))
+    cv = float(np.median(tot))
+    rec("T8", "is fp_arrival KNOB-RESPONSIVE, or just design identity?",
+        "WARN" if cv < 0.01 else "PASS",
+        f"median per-cell CV across knob configs = {cv:.4f} (ethernet 0.0000 — EXACTLY constant). "
+        f"=> fp_arrival is a per-endpoint STRUCTURAL prior (which endpoints are inherently slow, "
+        f"worth +0.476 R2 on the same task our head scores -0.508 on) but carries ZERO knob "
+        f"response. The delta target correctly removes the structural baseline; the KNOB response "
+        f"must still come from knobs x graph (F2). Do NOT claim the prior supplies per-config info.")
+
+TESTS = {"T1": T1, "T2": T2, "T3": T3, "T4": T4, "T5": T5, "T6": T6, "T7": T7, "T8": T8}
 if __name__ == "__main__":
     want = [a for a in sys.argv[1:] if a in TESTS] or list(TESTS)
     print(f"\n{'='*78}\nSTRESS TEST — architecture.md claims vs the real data\n{'='*78}\n")
