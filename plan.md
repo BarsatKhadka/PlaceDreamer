@@ -76,15 +76,54 @@ The nets are borrowed. The contribution is:
 - **Staged, inspectable world model** — floorplan→placement→routing with a *visible*
   intermediate placement (FastTuner uses one flat PPA estimator; we imagine the stages).
 - **Stage-wise actions** — the agent picks knobs *between* imagined stages (real MDP).
-- **The composition / compounding problem** ← the real research question. Every routing
-  predictor (MAGNet, Lay-Net, RouteNet) is trained and tested on **real** placements.
-  Feeding `f_route` an **imagined** placement from `f_place` is out-of-distribution and
-  **nobody studies this.** Making the stack hold — and measuring how much imagination
-  degrades vs. real placement — is the MBPO error-compounding problem applied to EDA.
+- **The composition problem** ← the real research question. Every routing predictor
+  (MAGNet, Lay-Net, RouteNet) is trained and tested on **real** placements. Feeding
+  `f_route` an **imagined** placement from `f_place` is out-of-distribution.
+
+  > **CORRECTED 2026-07-16 — "nobody studies this" is NO LONGER TRUE AS WRITTEN, and the
+  > direction of the effect was WRONG.**
+  > - **PowPrediCT (DAC'24, Yibo Lin)** studies exactly the placement→CTS-power seam with a
+  >   real curriculum: pretrain on post-route graphs → swap the input to placement graphs →
+  >   fine-tune. Cross-design leave-one-out total-power rel-err: Innovus 9.652%, vanilla GNN
+  >   **14.149%** (worse than the tool), **Phase-1-only 5.106% → full 1.981%**. That is
+  >   scheduled sampling; they never name it.
+  > - **MasterRTL §IV.A (ICCAD'23)** chains a tree on its OWN predictions: vs post-place truth,
+  >   the REAL netlist gives TNS MAPE **62%** while CHAINED-ON-PREDICTED gives **4%**.
+  >   *"chained predictions achieve similar or even higher accuracy than ground-truth."*
+  >
+  > ⇒ **Imagination is not only a tax — it is a CALIBRATION CHANNEL.** The downstream model
+  > learns to invert the upstream model's systematic bias, which it cannot do if it only ever
+  > sees clean input. Our dual-eval must be able to report `imagined > real` as a FINDING.
+  >
+  > **The honest, still-strong claim:** nobody chains a full imagined **per-node physical
+  > state** through **≥2** learned stage models, and **nobody has named it exposure bias**
+  > (verified: "exposure bias"/"teacher forcing" appear NOWHERE in this literature; "world
+  > model"+"physical design" → 0 hits; Agnesina/Lim NeurIPS'20-wkshp *proposed* our staged
+  > formulation and never built it — their environment stayed the real tool).
 - **Active grounding** — deciding when to spend a real OpenROAD run.
 
 Honest risk: this overlaps FastTuner. The delta must be the **staged model + stage-wise
 actions + composition** — not "RL for DSE," which they already did.
+
+> **VERIFIED 2026-07-16 (FastTuner ISPD'24 read in full):** the overlap is SMALLER than feared.
+> FastTuner models **zero stages** — its MDP state is *"the configuration of the parameters
+> tuned from time steps 1..t−1"* plus a static design embedding, reward is **terminal-only**,
+> and the "stages" are just a naming convention on the knob list. It is a **contextual bandit
+> in MDP notation**. Its GNN embedding is a **7-entry lookup table** (7 designs; the netlist is
+> identical across knob configs — our F1, confirmed in the wild), its estimator is evaluated
+> **within-design, Pearson-only, no cross-design number**, and zero-shot transfer is
+> **1.8–2.5× worse** than tuned (and loses to BO on 2/3).
+> **AND ITS TABLE 6 IS OUR MOTIVATION:** all > CTS+route > route-only on **7/7 designs, 3/3
+> metrics** — locking placement knobs costs **12–34 TNS points**. Independent industrial
+> evidence that `f_place` is the load-bearing hop, in the competitor's own data.
+>
+> **The strongest argument AGAINST us is TimingPredict (DAC'22)**, which exists to replace a
+> chained *RF-net-delay + analytic PERT-traversal* pipeline (Barboza) — structurally our design —
+> and shows vanilla GNNs collapse cross-design (GCNII R² −0.84/−0.78/−1.51). The resolution:
+> they replaced **analytic** propagation with **LEARNED** propagation (topological + max), which
+> is what §6 of `docs/model_architecture.md` specifies. **Our defense must be stated in the
+> paper: we need the INSPECTABLE intermediate state for stage-wise RL actions — a use case
+> TimingPredict does not have.**
 
 ---
 
@@ -137,3 +176,13 @@ Three groups (details in `docs/features.md`):
 - ✅ Seed sweep running (~19% of 600).
 - ✅ Literature surveyed; papers pulled; architecture direction set.
 - ⬜ `f_route` → `f_place` → compose/compounding test → agent → CTS.
+
+1. graph (cell↔net, driver/sink)          ✓ VERIFIED CORRECT
+2. node features                          ← just fixed types + dead dims
+                                             PE still broken (agent running)
+3. input encoders  (MLP cell→d, MLP net→d, type_emb)     ← NEXT
+4. virtual nodes   (METIS partition, VN init, knob/ctx injection)
+5. message passing (K=4 × HyperConv)      ← unnormalized-aggregation bug lives here
+6. readout heads   (per-net, per-cell, global)  ← knobs dead in the per-net head
+7. loss
+8. evaluation                             ← the instruments that lie
