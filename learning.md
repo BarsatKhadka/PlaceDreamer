@@ -334,6 +334,78 @@ against a 0.905 ceiling — **still an open gap worth chasing.**
 
 ---
 
+## 4e. WHY A GNN — the inductive bias, and the one fact that forces the architecture
+
+This section exists because "we are just putting things" is a fair charge. Everything below is
+derived from one MEASURED fact, not from taste.
+
+### MEASURED — THE FACT: the input graph is IDENTICAL across a design's 108 knob configs
+
+`cache_graphs.py: IN_STAGE = "floorplan"`. For every design checked (sasc, ac97_ctrl, aes_core,
+ethernet), across configs 1/40/80:
+
+| design | raw cells (incl tapcells) | KEPT cells | cell_names | cell_x |
+|---|---|---|---|---|
+| sasc | 575 → 560 → 474 | **275 → 275 → 275** | **IDENTICAL** | **IDENTICAL** |
+| ac97_ctrl | 9994 → 9995 → 8107 | **4567 → 4567 → 4567** | **IDENTICAL** | **IDENTICAL** |
+
+`cell_x` drift across configs = **0.0000**. Only the tapcell count moves (they tile the core, so
+they scale with die area) — and `live_cells()` drops tapcells. Floorplan knobs do not
+re-synthesize the netlist.
+
+So: **G_D does not depend on k.**
+
+### The consequences are not opinions, they are implications
+
+Write the model as `y(D,k) = F(G_D, k)`. Since `G_D ⟂ k`:
+
+1. **Any pooling of the graph is a design fingerprint — CONSTANT in k.** A permutation-invariant
+   readout over `h(G_D)` returns the same vector for all 108 configs. It is *structurally
+   incapable* of expressing knob response. Our ~680k-parameter encoder computes, with respect to
+   the knobs, **a constant**.
+2. **Knob response can only flow through the 5-dim knob vector.** Hence OLS-on-3-knobs beating the
+   GNN (wns 0.649 vs −1.102) is **not** a tuning failure — the GNN has *no additional information*.
+   The linear model already sees 100% of the varying input.
+3. **Hence DIRECT_KNOB is not a trick, it is the only signal path.** Measured: +0.505 on f_cts
+   buffers, +0.109 on wns. Diffusing knobs through `ctx` and K message-passing layers over a FIXED
+   graph smears the only informative input into a design-constant representation.
+4. **"pooled R² is ~99% design identity"** — we wrote that as a warning. It is literally true:
+   the pooled readout *is* design identity, by construction.
+5. **"coverage-limited" restated**: for the LEVEL task the GNN has **18 training examples** — one
+   per distinct graph — not 1944. That is the real n.
+6. **Where the GNN genuinely earns its keep**: *within* a fixed graph, which net is long / which
+   cell is critical is a structural question. Measured: per-net HPWL ranking **AUC 0.912** vs
+   Net2's 0.922. That is the job message passing is built for.
+
+### The forced architecture
+
+    y(D, k)  =  Level(G_D)                 <- needs the graph        -> GNN
+              + KnobResponse(k, scalars)   <- needs only the knobs   -> direct MLP + physics prior
+
+**The level/deviation split (Barsat's "is the z-score within the design?") is exactly this
+factorization.** It was never a normalization trick — it is the correct decomposition of the
+problem, and it works because it matches the information structure of the data.
+
+**Physics supplies the FORM of the knob term** (so the net learns a residual, not the law):
+- HPWL ∝ √A, and A = cell_area/utilization  ⇒  `log HPWL ≈ −0.5·log(util) + c`
+- clock power = C·V²·f (α=1 for a clock) ⇒  `log P ≈ −log(clock_period) + c`.
+  MEASURED: cts_power knob-response R² **0.905** from clock_period alone.
+- buffers: `n_buf ≈ max(n_sinks/(F_eff−1), 1.5·√(n·A)/d_max)` — the two regimes (§2).
+This is Barsat's old task #7 ("does the residual beat HPWL?") returning as the right architecture.
+
+### What this predicts (falsifiable)
+- A small MLP on (knobs, die_area, √(n·A), design scalars) should MATCH the full GNN on every
+  global knob-response target. **Untested — this is the honest ablation we owe.**
+- The GNN should only beat it on per-net/per-cell tasks (ranking) and on cross-design LEVEL.
+- **Corollary for the seam**: what should cross is the PER-NODE/PER-NET structure (the GNN's
+  actual product), NOT global scalars — the downstream stage can compute those from the knobs
+  itself. That is a testable seam redesign.
+- **Corollary for the CTS sweep**: in SwiftCTS the CTS knobs vary *per placement*, so the graph is
+  still fixed but the placement (and hence real geometry) varies — which is exactly why placement
+  becomes load-bearing there (+0.124, §4c) and is worthless here.
+
+---
+
 ## 5. Open questions / decisions needed
 
 1. **HYPOTHESIS (under test)**: f_cts's dev heads had **no direct knob path** — knobs reached
