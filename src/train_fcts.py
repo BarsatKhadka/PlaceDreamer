@@ -73,13 +73,17 @@ def run_fold(fi, test_designs, dev):
     print(f"\n=== fold {fi}: test {test_designs}  SEAM={SEAM_MODE}", flush=True)
     print(f"    train {len(tr)} flows/{len(train_d)} designs | val {len(val_d)} | test {test_designs}", flush=True)
     set_norm(train_d)                          # norm must exist before the seam builds place_state
-    # SEAM: activate the placement-state input. 'real' = teacher-forced; 'imagined' = f_place ckpt.
+    # SEAM: load the same-fold f_place if a ckpt is given — needed to feed IMAGINED placement
+    # state (for imagined training AND for the imagined-input eval below). 'real' reads the real
+    # placement state straight from EDA-Schema and needs no f_place.
     place_model = None
-    if SEAM_MODE == "imagined":
+    if FPLACE_CKPT:
         place_model = FPlace(d=DIM, K=LAYERS, encoder=ENCODER).to(DEV)
         place_model.load_state_dict(torch.load(f"{FPLACE_CKPT}/fold{fi}.pt", map_location=DEV))
         place_model.eval()
-    fcts.set_seam(SEAM_MODE, place_model)
+    if SEAM_MODE == "imagined" and place_model is None:
+        raise SystemExit("SEAM_MODE=imagined needs FPLACE_CKPT=<dir with foldN.pt>")
+    fcts.set_seam(SEAM_MODE, place_model)          # TRAINING consumes SEAM_MODE's placement state
     model = FCTS(d=DIM, K=LAYERS, encoder=ENCODER).to(DEV)
     opt = torch.optim.Adam(model.parameters(), lr=LR)
     sched = torch.optim.lr_scheduler.ReduceLROnPlateau(opt, mode="max", factor=0.5, patience=10, min_lr=1e-5)
@@ -104,14 +108,28 @@ def run_fold(fi, test_designs, dev):
               f"wns {g_('cts_wns','knob_r2'):+.2f} | lr {opt.param_groups[0]['lr']:.1e} ({time.time()-t0:.0f}s)", flush=True)
     if best_state: model.load_state_dict(best_state)
     torch.save(model.state_dict(), f"{OUT}/fold{fi}.pt")
-    res = evaluate(model, te)
-    print(f"  TEST (unseen designs):", flush=True)
-    for k in ALL:
-        if k in res:
-            r = res[k]
-            print(f"      {k:12} knob-R² {r.get('knob_r2',float('nan')):+.3f}  "
-                  f"abs-R² {r['abs_r2']:+.3f}  rel-err {r['med_rel']*100:5.1f}%", flush=True)
-    return dict(fold=fi, test_designs=test_designs, metrics=res)
+    # DUAL EVAL — score the SAME trained f_cts feeding different placement state at its input:
+    #   REAL     -> ceiling: how good f_cts is with a perfect upstream (== teacher forcing at test)
+    #   IMAGINED -> deployment: fed f_place's PREDICTION (the real pipeline).
+    # REAL - IMAGINED = the compounding. A seam-on model has the extra input dims either way, so we
+    # just swap the VALUES fed in; only a standalone (mode=None) model is evaluated as-is.
+    if SEAM_MODE is None:
+        eval_modes = [(None, None)]
+    else:
+        eval_modes = [("real", None)] + ([("imagined", place_model)] if place_model is not None else [])
+    U = {"cts_buffers": "cells", "cts_power": "W", "cts_wns": "ns", "cts_tns": "ns"}
+    all_res = {}
+    for emode, pm in eval_modes:
+        fcts.set_seam(emode, pm)
+        res = evaluate(model, te); all_res[emode or "standalone"] = res
+        print(f"  TEST feeding {(emode or 'standalone').upper()} placement state (unseen designs):", flush=True)
+        for k in ALL:
+            if k in res:
+                r = res[k]
+                print(f"      {k:12} abs-err {r['med_ae']:>9.3g} {U[k]:5} knob-R² {r.get('knob_r2',float('nan')):+.3f}  "
+                      f"abs-R² {r['abs_r2']:+.3f}  rel-err {r['med_rel']*100:5.1f}%", flush=True)
+    fcts.set_seam(SEAM_MODE, place_model)          # restore training mode for any later fold
+    return dict(fold=fi, test_designs=test_designs, train_mode=SEAM_MODE, metrics=all_res)
 
 if __name__ == "__main__":
     dev, folds = TF.make_folds()

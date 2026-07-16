@@ -10,17 +10,16 @@
 #SBATCH --error=logs/%x_%A_%a.err
 #SBATCH --exclude=node049
 
-# THE SEAM (imagined) — f_cts consumes f_place's PREDICTION, not the real placement state.
-# This is the ACTUAL pipeline number: what f_cts scores when the upstream stage is a model.
+# THE SEAM (f_place -> f_cts). TWO runs per fold off ONE f_place, so they are directly comparable:
+#   REAL     : f_cts trained on the REAL placement state (from EDA-Schema)  -> perfect-upstream ceiling
+#   IMAGINED : f_cts trained on f_place's PREDICTED placement state         -> the real pipeline
+# Each trained f_cts is then DUAL-EVALUATED (fed real AND imagined state at test). The gap
+# REAL-input minus IMAGINED-input on the SAME model is the COMPOUNDING we are here to measure.
 #
-# Self-contained per fold so there is no dependency on stale runs and NO LEAKAGE:
-#   step 1) train f_place  (winning config) on fold F  -> runs/fplace_seam/foldF.pt
-#   step 2) train f_cts    SEAM_MODE=imagined on fold F, feeding runs/fplace_seam/foldF.pt
-# Both use TF.make_folds() with the same SEED, so fold F holds out the SAME designs in both
-# stages. f_place never trained on the designs f_cts is tested on -> the placement state it
-# feeds at test time is a genuine cross-design PREDICTION, exactly the deployed regime.
-#
-# Compare later against SEAM_MODE=real (teacher-forced) to read off the compounding gap.
+# Self-contained per fold, no leakage: f_place, f_cts-real and f_cts-imagined all use
+# TF.make_folds()/same SEED, so fold F holds out the SAME designs everywhere. f_place never
+# trained on the designs f_cts is tested on -> the imagined state fed at test is a genuine
+# cross-design prediction (the deployed regime), not something f_place memorised.
 
 set -euo pipefail
 mkdir -p logs runs
@@ -35,9 +34,13 @@ FOLD=${SLURM_ARRAY_TASK_ID}
 
 python -c "import torch; assert torch.cuda.is_available(), 'CUDA NOT VISIBLE'; print('GPU:', torch.cuda.get_device_name(0))"
 
-echo "=== [fold ${FOLD}] step 1/2: train f_place (winning config) -> runs/fplace_seam ==="
+echo "############ [fold ${FOLD}] 1/3: train f_place (winning config) -> runs/fplace_seam ############"
 FOLD=${FOLD} OUT=runs/fplace_seam python src/train_fplace.py
 
-echo "=== [fold ${FOLD}] step 2/2: train f_cts SEAM=imagined (feeds f_place's prediction) ==="
+echo "############ [fold ${FOLD}] 2/3: f_cts SEAM=real (real placement state; dual-eval) ############"
+FOLD=${FOLD} OUT=runs/fcts_real SEAM_MODE=real FPLACE_CKPT=runs/fplace_seam \
+    python src/train_fcts.py
+
+echo "############ [fold ${FOLD}] 3/3: f_cts SEAM=imagined (f_place's prediction; dual-eval) ############"
 FOLD=${FOLD} OUT=runs/fcts_imagined SEAM_MODE=imagined FPLACE_CKPT=runs/fplace_seam \
     python src/train_fcts.py
