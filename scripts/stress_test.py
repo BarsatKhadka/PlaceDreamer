@@ -209,15 +209,37 @@ def T7():
             ov.append(len(j) / max(len(a0), 1))
         if not P: continue
         fp, pr = np.concatenate(P), np.concatenate(Q)
-        sh = np.median(pr - fp)
-        res.append(1 - ((pr - (fp + sh)) ** 2).sum() / ((pr - pr.mean()) ** 2).sum())
+        # *** T7b WAS AN ORACLE. THIS IS THE RETRACTION. ***
+        # `sh = np.median(pr - fp)` fits the shift ON THE TEST DESIGN'S OWN TRUTH (pr). That is not
+        # "zero parameters" — it is one parameter fit on the answer, unavailable at test time. It
+        # was then compared against our trained head's HONEST cross-design -0.508 and the gap sold
+        # as a +0.98 R2 opportunity. It was the stated #1 priority in docs sections 2/6/9.
+        # MEASURED, fold 0, shift fit on TRAIN designs only (-7.328 ns) vs on the test design:
+        #     design      oracle sh   ORACLE R2     HONEST R2
+        #     ac97_ctrl    +0.121      +0.458        -205.6
+        #     sasc         +0.009      +0.379       -2363.7
+        #     systemcdes   -3.164      +0.911         -15.0
+        #     usb_funct    +0.172      +0.111         -28.0
+        #     MEAN                     +0.465        -653.1
+        # The per-design shifts do not transfer AT ALL. So the free prior does not beat our head by
+        # +0.98 R2 — our head BEATS the honest prior by ~653 R2. The -0.508 head is the best timing
+        # thing we have, not the disaster this test called it.
+        # WHY IT MATTERS BEYOND THE NUMBER: the shift is a DESIGN-LEVEL constant, so ENDPT_TARGET=
+        # delta asks a PER-NODE head to emit something only n=18 can teach. Measured delta by design:
+        # des3_area median 7.963 std 0.501 | ethernet 8.254/17.382 | ac97 0.214/0.948 | sasc 0.132/0.837
+        # -- a per-design offset wearing a residual's clothes. The delta run plateaus at ~5ns for
+        # exactly this reason. n=18 does not stop being n=18 because you moved it inside a per-node head.
+        sh_oracle = np.median(pr - fp)
+        r2_oracle = 1 - ((pr - (fp + sh_oracle)) ** 2).sum() / ((pr - pr.mean()) ** 2).sum()
+        res.append(r2_oracle); res_oracle.append(r2_oracle)
     r2 = float(np.mean(res))
     rec("T7a", "endpoints CHAIN across stages?", "PASS" if np.mean(ov) > 0.7 else "FAIL",
         f"floorplan->place_resized endpoint overlap {100*np.mean(ov):.1f}%")
-    rec("T7b", "zero-param copy of floorplan arrival beats our trained endpt head?",
-        "FAIL" if r2 > -0.508 else "PASS",
-        f"R2(copy+global shift) = {r2:+.3f} vs our trained head's -0.508 -> the FREE PRIOR beats it "
-        f"by {r2-(-0.508):+.2f} R2. We predict from scratch what we already know. "
+    rec("T7b-ORACLE", "zero-param copy of floorplan arrival beats our trained endpt head?",
+        "RETRACTED",
+        f"R2 = {r2:+.3f} — but the shift is fit ON THE TEST DESIGN'S TRUTH. Honest (train-fit) shift "
+        f"scores -653.1: our trained head's -0.508 BEATS the free prior by ~653 R2, it does not lose "
+        f"to it by +0.98. This test drove docs sections 2/6/9 priority 1. It was wrong. "
         f"[FAIL here = our architecture is wrong, not the test]")
 
 # ---------------------------------------------------------------- T8
