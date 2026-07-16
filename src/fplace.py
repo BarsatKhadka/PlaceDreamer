@@ -48,7 +48,18 @@ _META = _NORM = _T2N = None
 DIRECT_KNOB = bool(int(os.environ.get("DIRECT_KNOB") or "1"))  # A/B: raw knobs -> dev head
 AGGR = os.environ.get("AGGR", "mean")   # A/B: sum | mean | multi | gcn  — see HyperConv
 FUSE = os.environ.get("FUSE", "concat") # A/B: how the cell encoder fuses its 3 sources
-VN_KNOBS = bool(int(os.environ.get("VN_KNOBS") or "1"))  # A/B: do the knobs ride into the VN?
+VN_KNOBS = bool(int(os.environ.get("VN_KNOBS") or "1"))
+# A/B FLAG — the SUPER-VN (DE-HNN's "two-level VN hierarchy"). AUDITED from their source:
+# it is METIS at ONE granularity + ONE GLOBAL ROOT (pyg_dataset.py:109-111: top_part_id =
+# zeros(num_vn), num_top_vn = 1) — NOT two METIS granularities, which is what we assumed.
+# Their ablation is CUMULATIVE on single-design demand RMSE (Supp C.3 Table 7):
+#     +PD 8.765 -> +single-VN 8.687 (0.9%) -> +two-level 8.381 (3.5%);  vs NO VN at all: 4.4%.
+# We currently run METIS clusters with NO root — a config THEY NEVER TEST (their "single VN"
+# is one GLOBAL VN, graph_conv_hetero.py:473 batch = zeros_like(batch)). So we are neither
+# ablation row. Mechanism copied from graph_conv_hetero.py:386-391 (both levels init to
+# CONSTANT ZERO), :497 (down: h += (vn + top[top_batch])[batch]), :538-543 (up: top = top +
+# top_mlp(mean_pool(vn) + top)). Mean-pool only, no max. Updated only while l < K-1.
+SUPER_VN = bool(int(os.environ.get("SUPER_VN") or "0"))
 # The dehnn_novn sweep win likely means knobs-through-VN DILUTES them (LOSTIN warns of
 # exactly this: a knob supernode -> 40.7%% MAPE, late-concat -> 3.11%%). VN_KNOBS=0 keeps
 # the VN doing its STRUCTURAL job (long-range pooling) but stops routing knobs through it
@@ -853,6 +864,13 @@ class FPlace(nn.Module):
         self.virtualnode_encoder = Seq(Linear(self.vn_in_dim*2, d*2), LeakyReLU(), Linear(d*2, d))
         self.mlp_vn  = nn.ModuleList([Seq(Linear(d*2, d), LeakyReLU(), Linear(d, d)) for _ in range(K)])
         self.back_vn = nn.ModuleList([Seq(Linear(d*2, d), LeakyReLU(), Linear(d, d)) for _ in range(K)])
+        # SUPER-VN: one global root over the cluster-VNs. DE-HNN inits BOTH levels to constant
+        # zero (graph_conv_hetero.py:386-391) — not feature-pooled; VNs differentiate only
+        # through pooling. top_mlp mirrors their per-layer root update (:538-543).
+        self.super_vn = SUPER_VN
+        if self.super_vn:
+            self.top_emb = nn.Parameter(torch.zeros(d))
+            self.top_mlp = nn.ModuleList([Seq(Linear(d, d), LeakyReLU(), Linear(d, d)) for _ in range(K)])
         # --- OUR addition (architecture.md §2): knob+design context injected INTO the VN ---
         # (if VN is ablated away, ctx falls back to a one-shot input add — the only place it can go)
         self.ctx = Seq(Linear(knob + dfeat, d), LeakyReLU(), Linear(d, d))
@@ -946,6 +964,7 @@ class FPlace(nn.Module):
             vn_in = torch.cat([scatter(feat, part, 0, dim_size=nvn, reduce="mean"),
                                scatter(feat, part, 0, dim_size=nvn, reduce="max")], 1)
             vn = self.virtualnode_encoder(vn_in) + (ctx if self.vn_knobs else 0)
+            top = self.top_emb if self.super_vn else None
         else:
             h, h_net = h + ctx, h_net + ctx
         ntn, ttype, ntc = g["ntn"], g["ntn_type"], g["ntc"]
@@ -954,7 +973,10 @@ class FPlace(nn.Module):
             ttype, ntc = ttype[mask], ntc[:, mask]
         for l in range(self.K):
             if self.use_vn:
-                h = self.back_vn[l](torch.cat([h, vn[part]], 1)) + h
+                # DOWN: the root is SUMMED INTO the cluster VN, then broadcast to cells
+                # (graph_conv_hetero.py:497 — additive, every layer).
+                vn_eff = (vn + top) if self.super_vn else vn
+                h = self.back_vn[l](torch.cat([h, vn_eff[part]], 1)) + h
             h, h_net = self.convs[l](h, h_net, ntn, ttype, ntc)
             h     = F.leaky_relu(self.norms[l](h))
             h_net = F.leaky_relu(self.norms[l](h_net))
@@ -962,6 +984,8 @@ class FPlace(nn.Module):
                 vn_t = torch.cat([scatter(h, part, 0, dim_size=nvn, reduce="mean"),
                                   scatter(h, part, 0, dim_size=nvn, reduce="max")], 1)
                 vn = self.mlp_vn[l](vn_t) + vn
+                if self.super_vn:      # UP: VN -> root (mean-pool only), :538-543
+                    top = top + self.top_mlp[l](vn.mean(0) + top)
         return h, h_net, ctx
 
     def forward(self, g):

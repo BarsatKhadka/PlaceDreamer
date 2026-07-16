@@ -480,7 +480,7 @@ def print_metrics(res, title):
         print("      NOTE: Net2 (ASP-DAC'21) REGRESSES net length (label = post-placement bbox")
         print("      HPWL) — it does NOT use a ranking loss. What it never publishes is a um-level")
         print("      absolute error: it reports only binned correlation (>0.98) and top-10% AUC")
-        print("      (92.5), the standard protocol in net-length works. So the field evaluates")
+        print("      (92.2 for NETS; their 92.5 is for PATHS, Table 4/8). So the field evaluates")
         print("      this ORDINALLY, which is why we do too — not because regression is")
         print("      impossible. Ranking is chosen for DECISION-THEORETIC reasons: MacroRank")
         print("      (ASP-DAC'23) picks a rank loss because 'the relative relationship ... is")

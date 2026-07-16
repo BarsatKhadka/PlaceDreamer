@@ -46,11 +46,48 @@ pooled-GCN for WNS/TNS/power/area, measured XGBoost beating it, and **shipped tr
 
 ## 2. f_place
 
-### 2.1 Encoder — keep
-DE-HNN (directed hypergraph, driver/sink split, METIS VNs, SignNet PE), `VN_KNOBS=0 AGGR=multi
-FUSE=concat`. This is the part that works: **AUC 0.912**.
-> ⚠️ OPEN: we claim "DE-HNN-exact" and have never verified it. Their ablation says a **two-level VN
-> hierarchy is +3.4%** vs **+1.0%** for the single VN we use. Audit pending.
+### 2.1 Encoder — AUDITED against DE-HNN's source. We are NOT "DE-HNN-exact".
+**The conv layer MATCHES** their current `dehnn_layers.py:49-75` line-for-line (concat order,
+shared forward/back conv, residual-to-input). This part is fine, and it works: **AUC 0.912**.
+(Note: their *paper's* conv differs from their *repo's* — the paper has no source/sink split on
+cell→net. We match the repo.)
+
+**But everything else is ours, and two of our comments were factually FALSE:**
+- ❌ *"DE-HNN: nets carry no PE"* — **their nets DO get PE** (`pyg_dataset.py:145`). FIXED.
+- ❌ *"DE-HNN drops nets with fanout ≥3000"* — **their filter is a NO-OP BUG**: they threshold
+  `net_features[:,1]`, which is the **first Laplacian eigenvector**, against 3000. Entries ≪3000 ⇒
+  zero nets dropped. We are not behind them; they never did it. FIXED.
+- **PE also differs**: ours is cell↔cell clique-expanded + `which="SM"`; theirs is **bipartite
+  cell+net** with scipy's default **`'LM'` (LARGEST eigenvalues)**. Ours is arguably better —
+  but it is OURS.
+- **DE-HNN feeds NO knobs.** Their entire design-context mechanism is `global_info =
+  Tensor([num_nodes])` — one scalar, the node count — **off by default**. Our ctx MLP has no
+  counterpart there.
+- **Their targets are z-scored PER DESIGN** (`train_all_cross.py:102-104`), so the model
+  structurally never predicts a cross-design level. **Our level/deviation split has no DE-HNN
+  counterpart and needs none** — it is the price of asking a question they never ask.
+- **Their cross-design script is BROKEN**: `all_valid_indices, all_test_indices =
+  load_data_indices[10:], load_data_indices[10:]` — **val IS test** — and the checkpoint is
+  selected on the **training** loss. **Our protocol is strictly better. Do NOT calibrate to their
+  numbers.**
+
+### 2.1b THE SUPER-VN — the one real DE-HNN gap (`SUPER_VN=1`)
+**We had the concept wrong.** "Two-level VN hierarchy" is **METIS at ONE granularity + ONE GLOBAL
+ROOT** (`pyg_dataset.py:109-111`: `top_part_id = zeros(num_vn)`, `num_top_vn = 1`) — *not* two
+METIS granularities.
+**Their ablation is CUMULATIVE**, single-design demand RMSE (Supp C.3 Table 7):
+`+PD 8.765 → +single-VN 8.687 (0.9%) → +two-level 8.381 (3.5%)`; vs **no VN at all: 4.4%**.
+(There is **no cross-design VN ablation** in the paper.)
+**We are NEITHER ablation row**: their "single VN" is one *global* VN
+(`graph_conv_hetero.py:473 batch = zeros_like(batch)`); we run METIS clusters with **no root** —
+a config they never test.
+Implemented (mechanism copied from `graph_conv_hetero.py:386-391, 497, 538-543`): both levels init
+to **constant zero**; DOWN `h += (vn + top)[part]` every layer; UP `top = top + top_mlp(mean(vn) +
+top)` while `l < K-1`; **mean-pool only, no max**. VERIFIED: +33k params, root gradient 2342 (it
+is in the computation, not dangling).
+> `VN_KNOBS=0` (production) means we currently have **NO global path through the VN at all** —
+> so our VN_KNOBS result is evidence that *knob delivery via the VN* hurts, **not** that a pooled
+> structural root hurts. Different intervention. The super-VN is untested, not refuted.
 
 ### 2.2 Per-net head — keep, it is our best asset
 `net_hpwl`. AUC 0.912. **Everything downstream should be composed from this**, not re-derived.
@@ -282,6 +319,7 @@ SwiftCTS (CTS knobs varied) it has **+0.124**. **The seam is only real in the kn
    ABSOLUTE coords = the gauge trap) to `(w, h, area, aspect, radius_of_gyration)`. Reuse
    MacroRank's `get_ensity_map()`. **Per-cell absolute position is unlearnable and we have proof —
    our own die-centre collapse plus TransPlace's 25,753× ablation. Do not try again.**
-4. **DE-HNN audit** — two-level VN is +3.4% vs our +1.0%.
+4. **SUPER-VN** (`SUPER_VN=1`) — the one real DE-HNN gap; implemented, untested. Their gain is
+   +3.5% cumulative (single-design). Cheap: +33k params, no re-cache.
 5. **Data** — CTS knobs (SwiftCTS: 5400 runs, 540 placements × 10 configs) and more designs (18 is
    the level bottleneck). **This is what raises the ceiling; 1–4 only make the model principled.**

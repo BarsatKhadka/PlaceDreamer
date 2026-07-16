@@ -51,7 +51,9 @@ for di, dsg in enumerate(designs):
         for c, n in zip(arr[0], arr[1]):
             net_cells.setdefault(int(n), []).append(int(c))
 
-    # cell<->cell adjacency via nets (clique-expand, skipping clock-like nets as Net2 does:
+    # cell<->cell adjacency via nets (clique-expand, skipping clock-like nets).
+    # NOTE (AUDITED): the skip is OURS, NOT Net2's. Net2 runs hMETIS on the HYPERGRAPH and
+    # never clique-expands, so it needs no such skip. We need it BECAUSE we clique-expand.
     # a 10k-fanout net would clique-expand into 50M edges and dominate the partition)
     adj = [[] for _ in range(C)]
     for n, cs in net_cells.items():
