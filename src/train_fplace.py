@@ -34,6 +34,7 @@ import os, sys, glob, json, time, random
 import numpy as np, pandas as pd, torch
 from scipy.stats import pearsonr
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import fplace
 from fplace import (FPlace, load_graph, gnll, meta, CACHE, set_norm, denorm,
                     norm, recon, GLOBAL_TARGETS)
 
@@ -223,7 +224,11 @@ def evaluate(model, flows):
         # append every flow (NaN if no endpoints) so wns/tns stay aligned with dz.
         ep = g["ep_idx"]
         if len(ep):
-            slk = denorm("endpt", o["endpt"][ep,0].cpu().numpy())
+            pred = denorm("endpt", o["endpt"][ep,0].cpu().numpy())
+            # If the head predicts ARRIVAL, recover slack by MasterRTL's identity — the knob
+            # enters here ARITHMETICALLY, not through the network:
+            #     slack = require_time - arrival,   require_time = clock_period
+            slk = (g["clock_period_raw"] - pred) if fplace.ENDPT_TARGET == "arrival" else pred
             wns_p, tns_p = float(slk.min()), float(slk[slk<0].sum())
         else:
             wns_p = tns_p = np.nan

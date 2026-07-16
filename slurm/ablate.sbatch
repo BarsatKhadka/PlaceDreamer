@@ -16,25 +16,37 @@
 # trained on 2 of the 5 LOCKED OOD designs). So nothing below is decided locally: the cluster,
 # on the real folds with the real protocol, decides.
 #
-#   cfg 0  base   WNS_HEAD=0 GEO_FEATS=0 CRIT_KNOB=0 HPWL_COMPOSE=pool   <- reproduces what we ship
-#   cfg 1  +wns   WNS_HEAD=1 ...                                          <- real wns/tns heads
-#   cfg 2  +sum   ...                          HPWL_COMPOSE=sum           <- analytic composition
-#   cfg 3  +geo   GEO_FEATS=1 CRIT_KNOB=1 ...                             <- new features
-#   cfg 4  all    everything on
+#   cfg 0  base   everything off, HPWL_COMPOSE=pool, ENDPT_TARGET=slack  <- reproduces what we ship
+#   cfg 1  arriv  ENDPT_TARGET=arrival                                    <- MasterRTL's decomposition
+#   cfg 2  +sum   HPWL_COMPOSE=sum                                        <- analytic composition
+#   cfg 3  +geo   GEO_FEATS=1 CRIT_KNOB=1                                 <- expected to do NOTHING
+#   cfg 4  all    arrival + sum (the two with real grounding)
 #
 # WHAT EACH IS EXPECTED TO MOVE, and the FAIR baseline it must beat (cluster fold-0 split, raw
 # knobs, no OOD contamination — see learning.md 4h):
 #
 #   target        fair baseline   shipped GNN   verdict
 #   total_hpwl        0.702          +0.654     wash        -> cfg 2 (+sum) targets this
-#   buffer_area       0.386          +0.474     GNN wins    -> should hold
-#   buffer_count      0.447          +0.595     GNN wins    -> should hold
-#   wns               0.091          -1.102     CATASTROPHE -> cfg 1 (+wns) targets this
-#   tns               0.118          -0.126     bad         -> cfg 1
+#   buffer_area       0.386          +0.474     GNN WINS    -> should hold
+#   buffer_count      0.447          +0.595     GNN WINS    -> should hold
+#   wns/tns           WITHDRAWN      -1.102     -> cfg 1 targets this, as a clean A/B
+# (the wns/tns BARS are withdrawn: one baseline un-standardized with the TEST design's own
+#  mean/std, the other had no design term and scored -4.647. cfg0-vs-cfg1 needs neither.)
 #
-# cfg 1 is the highest-value test: the shipped model is WORSE THAN A 3-KNOB LINEAR MODEL on wns
-# (-1.102 vs 0.091) because WNS/TNS exist only as READOUTS off the per-cell endpt head, which is
-# our worst prediction (pooled R2 -0.508). Real heads + the DIRECT_KNOB path are the fix.
+# cfg 1 (arrival) is the highest-value test, and it REPLACED an earlier "+wns real heads" arm that
+# was BACKWARDS. Reading MasterRTL's source (paperCodes/MasterRTL) showed our WNS readout IS their
+# architecture: graph_stat.cal_timing does slack = require_time - arrival (require_time = the CLOCK
+# PERIOD), then wns = min(slack), tns = sum(slack) — identities, exactly like ours. Their level-1
+# per-path RandomForest is accurate; OUR level-1 (endpt head) is broken (pooled R2 -0.508). So the
+# defect is the TARGET, not the readout: slack carries the knob, arrival carries the structure.
+# MEASURED per-endpoint CV across a design's knob configs (std/|mean|, lower = more structural):
+#   slack   1.364 / 2.028 / 0.492 / 0.181      (ac97 / usb_funct / sasc / systemcdes)
+#   arrival 0.076 / 0.329 / 0.103 / 0.191      -> up to 18x more stable
+# Predicting arrival leaves the head a purely STRUCTURAL job and recovers slack by exact
+# arithmetic, so the GNN never learns a timing knob response at all.
+# NOTE: every wns BAR I previously quoted is withdrawn — both baselines were invalid (one
+# un-standardized using the TEST design's own stats; the other had no design term). cfg 0 vs
+# cfg 1 is a clean A/B and does not depend on any of those numbers.
 #
 # cfg 2: tot_hpwl = SUM_net HPWL_net is an IDENTITY, not a model. The GNN predicts the per-net
 # unknown (AUC 0.912, ~1e6 labels) and an exact formula aggregates — GRANNITE's pattern (DAC'20).
@@ -58,14 +70,14 @@ cd "${HOME}/PlaceDreamer"
 IDX=${SLURM_ARRAY_TASK_ID}
 CFG=$((IDX / 3)); FOLD=$((IDX % 3))
 case $CFG in
-  0) NAME=base; WNS_HEAD=0; GEO_FEATS=0; CRIT_KNOB=0; HPWL_COMPOSE=pool ;;
-  1) NAME=wns;  WNS_HEAD=1; GEO_FEATS=0; CRIT_KNOB=0; HPWL_COMPOSE=pool ;;
-  2) NAME=sum;  WNS_HEAD=0; GEO_FEATS=0; CRIT_KNOB=0; HPWL_COMPOSE=sum  ;;
-  3) NAME=geo;  WNS_HEAD=0; GEO_FEATS=1; CRIT_KNOB=1; HPWL_COMPOSE=pool ;;
-  4) NAME=all;  WNS_HEAD=1; GEO_FEATS=1; CRIT_KNOB=1; HPWL_COMPOSE=sum  ;;
+  0) NAME=base;  WNS_HEAD=0; GEO_FEATS=0; CRIT_KNOB=0; HPWL_COMPOSE=pool; ENDPT_TARGET=slack   ;;
+  1) NAME=arriv; WNS_HEAD=0; GEO_FEATS=0; CRIT_KNOB=0; HPWL_COMPOSE=pool; ENDPT_TARGET=arrival ;;
+  2) NAME=sum;   WNS_HEAD=0; GEO_FEATS=0; CRIT_KNOB=0; HPWL_COMPOSE=sum;  ENDPT_TARGET=slack   ;;
+  3) NAME=geo;   WNS_HEAD=0; GEO_FEATS=1; CRIT_KNOB=1; HPWL_COMPOSE=pool; ENDPT_TARGET=slack   ;;
+  4) NAME=all;   WNS_HEAD=0; GEO_FEATS=0; CRIT_KNOB=0; HPWL_COMPOSE=sum;  ENDPT_TARGET=arrival ;;
   *) echo "bad array index $IDX (expected 0-14)" >&2; exit 1 ;;
 esac
-export WNS_HEAD GEO_FEATS CRIT_KNOB HPWL_COMPOSE FOLD
+export WNS_HEAD GEO_FEATS CRIT_KNOB HPWL_COMPOSE ENDPT_TARGET FOLD
 export ENCODER=dehnn VN_KNOBS=0 AGGR=multi FUSE=concat   # winning encoder, pinned in every arm
 export OUT="runs/ab_${NAME}"
 
@@ -76,5 +88,5 @@ if [ "$NC" -ne "$NG" ] || [ "$NC" -eq 0 ]; then
 fi
 
 python -c "import torch; assert torch.cuda.is_available(), 'CUDA NOT VISIBLE'; print('GPU:', torch.cuda.get_device_name(0))"
-echo "=== cfg ${CFG} (${NAME})  FOLD=${FOLD}  WNS_HEAD=${WNS_HEAD} GEO_FEATS=${GEO_FEATS} CRIT_KNOB=${CRIT_KNOB} HPWL_COMPOSE=${HPWL_COMPOSE} ==="
+echo "=== cfg ${CFG} (${NAME}) FOLD=${FOLD} ENDPT_TARGET=${ENDPT_TARGET} HPWL_COMPOSE=${HPWL_COMPOSE} GEO_FEATS=${GEO_FEATS} CRIT_KNOB=${CRIT_KNOB} ==="
 python src/train_fplace.py

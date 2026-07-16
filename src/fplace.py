@@ -102,6 +102,15 @@ TARGETS        = LOG_TARGETS
 # Fair-split evidence (cluster fold 0, raw-knob baseline, no OOD): the shipped readout scores
 # wns -1.102 / tns -0.126 while a 3-knob OLS gets 0.091 / 0.118 — the model is WORSE THAN
 # TRIVIAL, and endpt (its source) is our worst head (pooled R2 -0.508). This flag is the fix.
+# A/B FLAG — what does the per-cell timing head predict?
+#   "slack"   : the shipped target. Carries the CLOCK KNOB, so the head must learn structure
+#               AND the knob dependence at once. Pooled R2 -0.508 (our worst head).
+#   "arrival" : MasterRTL's decomposition (graph_stat.cal_timing):
+#                   slack = require_time - arrival,   require_time = clock_period
+#               arrival is STRUCTURAL — measured up to 18x more stable across knob configs
+#               (per-endpoint CV: arrival 0.076 vs slack 1.364 on ac97). The head then has a
+#               purely structural job and slack is recovered by EXACT ARITHMETIC.
+ENDPT_TARGET = os.environ.get("ENDPT_TARGET", "slack")   # slack | arrival
 WNS_HEAD = bool(int(os.environ.get("WNS_HEAD") or "1"))
 # A/B FLAG. crit_path = clock_period - fp_wns = the design TIMING SCALE theta(G_D).
 # Fair-split gain is SMALL: wns 0.091 -> 0.118, tns 0.118 -> 0.183 (not the 0.143 ->
@@ -381,9 +390,14 @@ def set_norm(train_designs, force=False):
         _NORM[f"y_{k}_s"] = np.float32(v.std() + 1e-6)
     # per-ENDPOINT slack target: standardize raw slack over train designs' endpoint labels
     es = []
+    _mt = meta()
     for dsg in sorted(train_designs):
         for p in sorted(glob.glob(f"{ROOT}/cache/endpt/{dsg}-*.npz"))[::11][:10]:
-            es.append(np.load(p)["ep_slack"])
+            _v = np.load(p)["ep_slack"]
+            if ENDPT_TARGET == "arrival":        # stats must match the TARGET (see ENDPT_TARGET)
+                _fid = os.path.basename(p)[:-4]
+                if _fid in _mt.index: _v = float(_mt.loc[_fid].clock_period) - _v
+            es.append(_v)
     es = np.concatenate(es) if es else np.zeros(1, np.float32)
     _NORM["y_endpt_m"] = np.float32(es.mean()); _NORM["y_endpt_s"] = np.float32(es.std() + 1e-6)
     # FLOORPLAN GEOMETRY feature stats (train designs only) — see load_graph. die = cell_area/util
@@ -634,7 +648,18 @@ def load_graph(flow_id, device="cpu"):
         raw = np.full(g["n_cells"], np.inf, np.float32)
         np.minimum.at(raw, idx_new, slk)                     # WORST slack per cell — fix (b)
         ep_idx = np.unique(idx_new)
-        y_ep[ep_idx] = (raw[ep_idx] - nm["y_endpt_m"]) / nm["y_endpt_s"]
+        # ENDPT_TARGET — slack | arrival.  MasterRTL's cal_timing is literally
+        #     slack = require_time - arrival,   require_time = THE CLOCK PERIOD
+        # so slack carries the knob and arrival carries the STRUCTURE. Predicting slack forces one
+        # head to learn both at once; predicting ARRIVAL leaves it a purely structural job (which
+        # is what a graph is for) and recovers slack by exact arithmetic.
+        # MEASURED — per-endpoint CV across a design's knob configs (std/|mean|, lower = more
+        # structural): slack 1.364 / 2.028 / 0.492 / 0.181  vs  arrival 0.076 / 0.329 / 0.103 /
+        # 0.191 (ac97 / usb_funct / sasc / systemcdes) — arrival is up to 18x more stable.
+        # Our slack head scores pooled R2 -0.508; this is the likeliest reason.
+        if ENDPT_TARGET == "arrival":
+            raw = float(m.clock_period) - raw                 # arrival = require_time - slack
+        y_ep[ep_idx] = (raw[ep_idx] - nm[f"y_endpt_m"]) / nm[f"y_endpt_s"]
         mask[ep_idx] = True
     g["y_endpt"] = t(y_ep); g["m_endpt"] = t(mask, torch.bool)
     g["ep_idx"] = torch.tensor(ep_idx, dtype=torch.long)         # labeled endpoint cells
@@ -668,6 +693,7 @@ def load_graph(flow_id, device="cpu"):
     g["y_vnbox"] = t(box); g["m_vnbox"] = t(mvn, torch.bool)   # [nvn,4] = xmin,ymin,xmax,ymax
     # raw recorded WNS/TNS — for eval readout comparison (complete, untruncated)
     g["wns_true"] = float(m.wns); g["tns_true"] = float(m.tns)
+    g["clock_period_raw"] = float(m.clock_period)   # for the arrival->slack identity
     return {k: (v.to(device) if torch.is_tensor(v) else v) for k, v in g.items()}
 
 # ---------- DE-HNN HyperConvLayer ----------
