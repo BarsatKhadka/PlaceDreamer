@@ -238,7 +238,16 @@ def evaluate(model, flows):
             # If the head predicts ARRIVAL, recover slack by MasterRTL's identity — the knob
             # enters here ARITHMETICALLY, not through the network:
             #     slack = require_time - arrival,   require_time = clock_period
-            slk = (g["clock_period_raw"] - pred) if fplace.ENDPT_TARGET == "arrival" else pred
+            # invert whatever the head predicts back to SLACK — the knob enters HERE, by
+            # arithmetic, never through the network:
+            #   slack  : as-is                     arrival: slack = T - arrival
+            #   delta  : arrival = fp_prior + delta ; slack = T - arrival
+            if fplace.ENDPT_TARGET == "delta":
+                slk = g["clock_period_raw"] - (g["fp_arr_ep"].cpu().numpy() + pred)
+            elif fplace.ENDPT_TARGET == "arrival":
+                slk = g["clock_period_raw"] - pred
+            else:
+                slk = pred
             wns_p, tns_p = float(slk.min()), float(slk[slk<0].sum())
         else:
             wns_p = tns_p = np.nan

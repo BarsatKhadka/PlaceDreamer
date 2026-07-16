@@ -121,7 +121,21 @@ TARGETS        = LOG_TARGETS
 #               arrival is STRUCTURAL — measured up to 18x more stable across knob configs
 #               (per-endpoint CV: arrival 0.076 vs slack 1.364 on ac97). The head then has a
 #               purely structural job and slack is recovered by EXACT ARITHMETIC.
-ENDPT_TARGET = os.environ.get("ENDPT_TARGET", "slack")   # slack | arrival
+# A/B FLAG — what does the per-cell timing head predict?
+#   "slack"   : the SHIPPED target. Carries the CLOCK KNOB, so one head must learn structure AND
+#               the knob dependence at once. Pooled R2 -0.508 — our worst head.
+#   "arrival" : MasterRTL/TimingGCN/RTL-Timer's target (slack = require_time - arrival,
+#               require_time = clock_period). Structural: per-endpoint CV across knob configs is
+#               up to 18x more stable than slack (stress_test T4, arrival wins 6/8 designs).
+#   "delta"   : arrival - arrival_FLOORPLAN. THE ONE THE DATA DEMANDS (stress_test T7b):
+#               a ZERO-PARAMETER copy of the floorplan arrival scores R2 +0.476 while our trained
+#               head scores -0.508 — the FREE PRIOR beats it by +0.98 R2. We were predicting from
+#               scratch what our own input stage already tells us.
+#               This is Delta-ML's pattern (a prior buys a persistent learning-curve offset ~ a
+#               fixed multiple of designs — the currency we lack at n=18) and PowPrediCT's
+#               (DAC'24), whose loss LITERALLY blends model residual with an early-stage feature:
+#                   swi_p = (model/scale)*res_portion + early_feature*early_mult*early_portion
+ENDPT_TARGET = os.environ.get("ENDPT_TARGET", "slack")   # slack | arrival | delta
 WNS_HEAD = bool(int(os.environ.get("WNS_HEAD") or "1"))
 # A/B FLAG. crit_path = clock_period - fp_wns = the design TIMING SCALE theta(G_D).
 # Fair-split gain is SMALL: wns 0.091 -> 0.118, tns 0.118 -> 0.183 (not the 0.143 ->
@@ -267,7 +281,8 @@ LOG_CELL   = [_c[i] for i in _LOG_CELL_RAW]
 IDENT_CELL = [_c[i] for i in _IDENT_CELL_RAW]
 LOG_DF     = [_f[i] for i in _LOG_DF_RAW]
 IDENT_DF   = [_f[i] for i in _IDENT_DF_RAW]
-CELL_IN    = len(KEEP_CELL) + 10          # 12 library + 10 PE = 22
+FP_PRIOR_DIM = 2                          # [z(fp_arrival), has_fp_arrival] — the FREE prior
+CELL_IN    = len(KEEP_CELL) + FP_PRIOR_DIM + 10   # 12 library + 2 prior + 10 PE = 24
 # A/B FLAG. GEO_FEATS=0 reproduces the shipped 16 netlist-only design features.
 # MEASURED (fair fold-0 split, no OOD): die_area adds NOTHING to knob response
 # (0.702 -> 0.702) and never could — within a design log(die)=log(cell_area)-log(util)
@@ -284,7 +299,7 @@ GEO_FEATS  = bool(int(os.environ.get("GEO_FEATS") or "1"))
 GEO_HEADS  = bool(int(os.environ.get("GEO_HEADS") or "0"))
 DF_IN      = len(KEEP_DF) + (2 if GEO_FEATS else 0)   # 16 netlist + 2 floorplan geometry
                                           # (log die_area, log sqrt(n*A) physics prior)
-PE_SLICE   = slice(len(KEEP_CELL), CELL_IN)   # the 10 PE dims, post-drop
+PE_SLICE   = slice(len(KEEP_CELL) + FP_PRIOR_DIM, CELL_IN)   # the 10 PE dims, post-drop
 
 def live_cells(d):
     """Boolean mask of cells with at least one signal pin.
@@ -413,12 +428,25 @@ def set_norm(train_designs, force=False):
     for dsg in sorted(train_designs):
         for p in sorted(glob.glob(f"{ROOT}/cache/endpt/{dsg}-*.npz"))[::11][:10]:
             _v = np.load(p)["ep_slack"]
-            if ENDPT_TARGET == "arrival":        # stats must match the TARGET (see ENDPT_TARGET)
-                _fid = os.path.basename(p)[:-4]
-                if _fid in _mt.index: _v = float(_mt.loc[_fid].clock_period) - _v
+            _fid = os.path.basename(p)[:-4]
+            if ENDPT_TARGET in ("arrival", "delta") and _fid in _mt.index:
+                _v = float(_mt.loc[_fid].clock_period) - _v          # -> arrival
+            if ENDPT_TARGET == "delta":
+                _fp = f"{ROOT}/cache/fp_arrival/{_fid}.npz"
+                if os.path.exists(_fp):
+                    _z = np.load(_fp); _idx = np.load(p)["ep_idx"]
+                    _base = _z["fp_arrival"][_idx]                    # prior at those endpoints
+                    _v = _v - _base                                   # -> DELTA
             es.append(_v)
     es = np.concatenate(es) if es else np.zeros(1, np.float32)
     _NORM["y_endpt_m"] = np.float32(es.mean()); _NORM["y_endpt_s"] = np.float32(es.std() + 1e-6)
+    # FLOORPLAN-ARRIVAL prior stats (train designs only) — for the INPUT FEATURE
+    fa = []
+    for dsg in sorted(train_designs):
+        for p in sorted(glob.glob(f"{ROOT}/cache/fp_arrival/{dsg}-*.npz"))[::11][:10]:
+            z = np.load(p); fa.append(z["fp_arrival"][z["mask"]])
+    fa = np.concatenate(fa) if fa else np.zeros(1, np.float32)
+    _NORM["fpa_m"] = np.float32(fa.mean()); _NORM["fpa_s"] = np.float32(fa.std() + 1e-6)
     # FLOORPLAN GEOMETRY feature stats (train designs only) — see load_graph. die = cell_area/util
     # and sqrt(n*A) are both pre-placement, so these are inputs, not leakage.
     _m = meta()                       # NOTE: m_all is only bound further down; use meta() here
@@ -557,6 +585,16 @@ def load_graph(flow_id, device="cpu"):
     t  = lambda a, dt=torch.float: torch.tensor(np.asarray(a), dtype=dt)
     # log1p the heavy-tailed magnitude dims, THEN z-score (train-fold stats). Must match set_norm().
     cell_x = (_pre(_cellfeat(d, keep), LOG_CELL) - nm["cx_m"]) / nm["cx_s"]
+    # FEED THE PRIOR. A prior you do not feed is a prior you cannot residual against — the whole
+    # +0.98 R2 (T7b) depends on the model SEEING arrival_floorplan, not just being scored on the
+    # delta. 2 dims: [z(fp_arrival), has_fp_arrival]. Inserted into the LIBRARY block BEFORE the
+    # PE dims, exactly as f_cts inserts its CTS features, so SignNet still sees the last 10 as PE.
+    _fa2 = np.load(f"{ROOT}/cache/fp_arrival/{flow_id}.npz")
+    _fv, _fm = _fa2["fp_arrival"][keep].astype(np.float32), _fa2["mask"][keep]
+    _fz = np.where(_fm, (_fv - nm["fpa_m"]) / nm["fpa_s"], 0.0).astype(np.float32)
+    cell_x = np.concatenate([cell_x[:, :len(KEEP_CELL)],
+                             np.stack([_fz, _fm.astype(np.float32)], 1),
+                             cell_x[:, len(KEEP_CELL):]], 1)
     net_x  = (_pre(_netfeat(d, flow_id), LOG_NET) - nm["nx_m"]) / nm["nx_s"]
     dfeat  = (_pre(_dffeat(d), LOG_DF) - nm["df_m"]) / nm["df_s"]
     # ---- FLOORPLAN GEOMETRY + PHYSICS PRIOR (leakage-free: both known BEFORE placement) ----
@@ -657,6 +695,12 @@ def load_graph(flow_id, device="cpu"):
     #      LAST one, and groupby sorts alphabetically, so /SET_B overwrote /D and the LESS
     #      critical slack systematically won: 15.2% of labels corrupted, and in 45% of flows
     #      the cell holding the WORST endpoint stored a non-worst slack. Take the MIN per cell.
+    # THE FREE PRIOR: per-cell FLOORPLAN arrival (worst=MAX over paths ending at the cell).
+    # Floorplan precedes placement => LEAK-FREE. Fed as an INPUT FEATURE in every mode, and used
+    # as the target base when ENDPT_TARGET=delta. See scripts/add_fp_arrival.py and T7b.
+    _fa = np.load(f"{ROOT}/cache/fp_arrival/{flow_id}.npz")
+    fp_arr = _fa["fp_arrival"][keep].astype(np.float32)
+    fp_msk = _fa["mask"][keep]
     ep = np.load(f"{ROOT}/cache/endpt/{flow_id}.npz")
     y_ep = np.zeros(g["n_cells"], np.float32); mask = np.zeros(g["n_cells"], bool)
     ep_idx = np.empty(0, np.int64)
@@ -676,12 +720,15 @@ def load_graph(flow_id, device="cpu"):
         # structural): slack 1.364 / 2.028 / 0.492 / 0.181  vs  arrival 0.076 / 0.329 / 0.103 /
         # 0.191 (ac97 / usb_funct / sasc / systemcdes) — arrival is up to 18x more stable.
         # Our slack head scores pooled R2 -0.508; this is the likeliest reason.
-        if ENDPT_TARGET == "arrival":
+        if ENDPT_TARGET in ("arrival", "delta"):
             raw = float(m.clock_period) - raw                 # arrival = require_time - slack
+        if ENDPT_TARGET == "delta":
+            raw = raw - fp_arr                                # Delta on the FREE floorplan prior
         y_ep[ep_idx] = (raw[ep_idx] - nm[f"y_endpt_m"]) / nm[f"y_endpt_s"]
         mask[ep_idx] = True
     g["y_endpt"] = t(y_ep); g["m_endpt"] = t(mask, torch.bool)
     g["ep_idx"] = torch.tensor(ep_idx, dtype=torch.long)         # labeled endpoint cells
+    g["fp_arr_ep"] = t(fp_arr[ep_idx]) if len(ep_idx) else t(np.zeros(0, np.float32))
     # per-cell PLACEMENT GEOMETRY targets: normalized (x, y) in [0,1] at place_resized.
     # Stored full-length (aligned to cell_names) like cache/cts, so [keep] compacts them the
     # same way every other per-cell array is compacted. NOT standardized: the target is already
