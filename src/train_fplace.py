@@ -62,6 +62,12 @@ W = dict(net_hpwl=float(E("W_NETHPWL", 5)),        # dense: ~10k nets/flow
          endpt=float(E("W_ENDPT", 3)),             # dense: ~700 endpoints/flow
          tot_hpwl=float(E("W_TOT", 1)), buf_area=float(E("W_BUFA", 1)),
          buf_cnt=float(E("W_BUFC", 1)),
+         # WNS/TNS as first-class global heads. They used to be READOUTS off the broken endpt
+         # head (pooled R2 -0.508) and scored -1.102 / -0.126 knob-response — worse than a
+         # constant, while plain OLS on the 3 raw knobs gets 0.649 / 0.657. Weighted like the
+         # other globals; the dev head already gets the raw knobs (DIRECT_KNOB), which is
+         # exactly where that 0.649 lives.
+         wns_g=float(E("W_WNS", 1)), tns_g=float(E("W_TNS", 1)),
          pos=float(E("W_POS", 5)),                 # dense: EVERY cell — placement GEOMETRY
          vnbox=float(E("W_VNBOX", 5)),             # per-METIS-cluster bbox — the POSED geometry
          dev=float(E("W_DEV", 3)))                 # knob-DEVIATION weight (the thing we want)

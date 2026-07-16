@@ -57,7 +57,7 @@ VN_KNOBS = bool(int(os.environ.get("VN_KNOBS") or "1"))  # A/B: do the knobs rid
 # NOTE: DE-HNN uses NEITHER sum NOR mean. They use gcn_norm-weighted sum
 # (train_all_cross.py:85-87): each edge weighted 1/sqrt(deg_i*deg_j). AGGR=gcn is that.
 # bump when set_norm's CONTENT changes (new keys/stats) so stale caches invalidate
-NORM_VERSION = 2
+NORM_VERSION = 3   # +geometry feats, +wns_g/tns_g global targets
 N_TYPES = 442            # 441 real cell types + 1 UNK slot (index 441)
 UNK_TYPE = 441
 
@@ -97,7 +97,23 @@ def meta():
 #     50% on wb_dma, where the min-readout is consequently wrong). OPEN.
 LOG_TARGETS    = ("net_hpwl", "tot_hpwl", "buf_area", "buf_cnt")
 TARGETS        = LOG_TARGETS
-GLOBAL_TARGETS = ("tot_hpwl", "buf_area", "buf_cnt")   # each -> a LEVEL head + a DEVIATION head
+GLOBAL_TARGETS = ("tot_hpwl", "buf_area", "buf_cnt", "wns_g", "tns_g")
+# each -> a LEVEL head + a DEVIATION head.
+#
+# wns_g/tns_g ADDED — and this is the biggest measured miss in f_place. WNS/TNS used to exist
+# ONLY as READOUTS off the per-cell endpt head (WNS=min, TNS=sum-neg), i.e. we derived timing
+# from our single worst prediction: endpt scores pooled R2 -0.508, ~100% rel err, calib z^2 9.63.
+# Result: f_place's wns knob-response was -1.102 and tns -0.126 -- WORSE THAN A CONSTANT.
+# But the signal is right there and trivially available:
+#     OLS on the 3 raw knobs alone -> wns within-design R2 0.649, tns 0.657  (clock_period)
+# So a 3-parameter linear model beat our GNN by 1.75 R2 on wns. That was never "timing does not
+# transfer cross-design" (a claim we repeated and which is false) -- it was an ARCHITECTURE gap:
+# no head, no direct knob path, derived from the broken endpt readout. Give them the same
+# level+deviation heads every other global target has, and the dev head already receives the raw
+# knobs directly (DIRECT_KNOB), which is exactly where the 0.649 lives.
+SIGNED_TARGETS = ("wns_g", "tns_g")     # signed -> signed-log transform, not log
+# (endpt stays: it is the per-cell timing state the seam forwards, and it is dense supervision.
+#  It is simply no longer the ONLY path to WNS/TNS.)
 
 def recon(k, lvl, dev, nm, w=None):
     """level + deviation -> log(target). Inverse of the decomposition in set_norm.
@@ -202,7 +218,8 @@ IDENT_CELL = [_c[i] for i in _IDENT_CELL_RAW]
 LOG_DF     = [_f[i] for i in _LOG_DF_RAW]
 IDENT_DF   = [_f[i] for i in _IDENT_DF_RAW]
 CELL_IN    = len(KEEP_CELL) + 10          # 12 library + 10 PE = 22
-DF_IN      = len(KEEP_DF)                 # 16
+DF_IN      = len(KEEP_DF) + 2             # 16 netlist + 2 floorplan geometry
+                                          # (log die_area, log sqrt(n*A) physics prior)
 PE_SLICE   = slice(len(KEEP_CELL), CELL_IN)   # the 10 PE dims, post-drop
 
 def live_cells(d):
@@ -333,6 +350,21 @@ def set_norm(train_designs, force=False):
             es.append(np.load(p)["ep_slack"])
     es = np.concatenate(es) if es else np.zeros(1, np.float32)
     _NORM["y_endpt_m"] = np.float32(es.mean()); _NORM["y_endpt_s"] = np.float32(es.std() + 1e-6)
+    # FLOORPLAN GEOMETRY feature stats (train designs only) — see load_graph. die = cell_area/util
+    # and sqrt(n*A) are both pre-placement, so these are inputs, not leakage.
+    _m = meta()                       # NOTE: m_all is only bound further down; use meta() here
+    gd, gs = [], []
+    for dsg in sorted(train_designs):
+        for p in sorted(glob.glob(f"{CACHE}/{dsg}-*.npz"))[::7][:16]:
+            fid = os.path.basename(p)[:-4]
+            if fid not in _m.index: continue
+            dv = np.asarray(np.load(p, allow_pickle=True)["df_vals"])
+            die = float(dv[3]) / max(float(_m.loc[fid, "utilization"]) / 100.0, 1e-6)
+            gd.append(np.log(die)); gs.append(0.5 * np.log(max(float(dv[0]), 1.0) * die))
+    gd, gs = np.array(gd), np.array(gs)
+    _NORM["g_die_m"] = np.float32(gd.mean()); _NORM["g_die_s"] = np.float32(gd.std() + 1e-6)
+    _NORM["g_snA_m"] = np.float32(gs.mean()); _NORM["g_snA_s"] = np.float32(gs.std() + 1e-6)
+
     # GEOMETRY BASELINE (train designs only): the mean VN box. This is the "learned nothing"
     # predictor the geometry head must BEAT — boxes are normalized by the die, so every design
     # is already on the same [0,1] scale and a single mean box is a fair, honest baseline.
@@ -367,8 +399,12 @@ def set_norm(train_designs, force=False):
     m_all = meta()
     dcol  = m_all.index.str.replace(r"-\d+$", "", regex=True)
     for k, col, off in (("tot_hpwl","total_hpwl",0.0), ("buf_area","buffer_area",1.0),
-                        ("buf_cnt","buffer_count",1.0)):
-        y = np.log(np.maximum(m_all[col].values.astype(np.float64), 0) + off + 1e-12)
+                        ("buf_cnt","buffer_count",1.0), ("wns_g","wns",0.0), ("tns_g","tns",0.0)):
+        v_ = m_all[col].values.astype(np.float64)
+        # wns/tns are SIGNED (slack is negative when violating) -> signed-log, same transform the
+        # endpt target and f_cts's cts_wns/cts_tns already use. log() would silently clamp them.
+        y = (np.sign(v_) * np.log1p(np.abs(v_)) if k in SIGNED_TARGETS
+             else np.log(np.maximum(v_, 0) + off + 1e-12))
         s = pd.Series(y, index=dcol)
         mu_d = s.groupby(level=0).mean()                       # per-design LEVEL (all designs)
         w_d  = s.groupby(level=0).std()                        # per-design WITHIN std
@@ -449,6 +485,25 @@ def load_graph(flow_id, device="cpu"):
     cell_x = (_pre(_cellfeat(d, keep), LOG_CELL) - nm["cx_m"]) / nm["cx_s"]
     net_x  = (_pre(_netfeat(d, flow_id), LOG_NET) - nm["nx_m"]) / nm["nx_s"]
     dfeat  = (_pre(_dffeat(d), LOG_DF) - nm["df_m"]) / nm["df_s"]
+    # ---- FLOORPLAN GEOMETRY + PHYSICS PRIOR (leakage-free: both known BEFORE placement) ----
+    # The 18 design features are all netlist-derived (n_cells, total_cell_area, fanouts...) —
+    # NOTHING told the model how big the die is. But the floorplan sets die = cell_area/util, so
+    # the model had to learn a division to recover it. Measured knob-response ceilings (OLS,
+    # within-design): tot_hpwl 0.719 from knobs alone -> 0.857 once die_area is available.
+    # f_place actually scores 0.654, so this feature is worth ~0.2 R2 and costs nothing.
+    # Leak check: log(cell_area/util) vs the die area measured from the PLACED cell bbox
+    # correlates R2 0.9961 — it genuinely is a pre-placement quantity, not placement info.
+    _cell_area = float(np.asarray(d["df_vals"])[3])                  # total_cell_area (synthesis)
+    _die = _cell_area / max(float(m["utilization"]) / 100.0, 1e-6)   # floorplan identity
+    # sqrt(n*A): the Beardwood-Halton-Hammersley / Rent scaling for total edge length over n
+    # points in area A. VERIFIED in the CTS literature as the clock-WL law (Charikar et al.,
+    # SIAM J. Discrete Math 2004: 1.5*sqrt(n) on a unit grid; Han/Kahng/Li TCAD'18 rederive
+    # sqrt(N*A) from H-tree algebra). Handing the model the physics form instead of making it
+    # discover sqrt of a product from log features.
+    _geo = np.array([(np.log(_die)          - nm["g_die_m"])  / nm["g_die_s"],
+                     (0.5*np.log(max(float(np.asarray(d["df_vals"])[0]),1.0) * _die)
+                                            - nm["g_snA_m"])  / nm["g_snA_s"]], np.float32)
+    dfeat = np.concatenate([dfeat, _geo])
     # knobs + FLOORPLAN-TIMING ANCHOR (fp_wns/fp_tns). The anchor gives the model the
     # design's baseline timing LEVEL — the part that doesn't transfer cross-design and
     # tanked WNS to R²=-0.77 without it. Leakage-free: floorplan is BEFORE placement.
@@ -489,8 +544,10 @@ def load_graph(flow_id, device="cpu"):
     dsg  = flow_id.rsplit("-", 1)[0]
     raws = dict(tot_hpwl=np.log(max(m.total_hpwl, 1e-6)),
                 buf_area=np.log(max(m.buffer_area, 0) + 1.0),
-                buf_cnt =np.log(max(bufcnt, 0) + 1.0) if np.isfinite(bufcnt) else np.nan)
-    for k in ("tot_hpwl", "buf_area", "buf_cnt"):
+                buf_cnt =np.log(max(bufcnt, 0) + 1.0) if np.isfinite(bufcnt) else np.nan,
+                wns_g   =_slog(float(m.wns)),      # SIGNED -> signed-log (see GLOBAL_TARGETS)
+                tns_g   =_slog(float(m.tns)))
+    for k in GLOBAL_TARGETS:
         i    = int(np.where(nm[f"MU_{k}_keys"] == dsg)[0][0])
         mu_d = float(nm[f"MU_{k}_vals"][i])                      # this design's LEVEL
         w_d  = float(nm[f"W_{k}_vals"][i])                       # this design's OWN within-std

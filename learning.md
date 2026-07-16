@@ -129,6 +129,7 @@ placement image only has to supply design identity. Our variance is design-to-de
 CTS knobs — the strictly harder direction. Their **counts-only ablation (7–9% power, 12–17%
 skew) is the closer analogue to our regime.**
 
+
 ---
 
 ## 3. The seam — what we found and fixed
@@ -246,6 +247,90 @@ target, not a low bar**.
   reconstructs for free, never a required input. Exactly our note, proven.
 - `fplace-timing-is-coverage-limited` has company: DATE'19 and MacroRank hit the same wall and
   took the same exit — drop cross-design absolute scale, keep within-design order.
+
+---
+
+## 4c. CORRECTION: "geometry is useless" was an ARTIFACT of EDA-Schema's pinned CTS knobs
+
+Barsat pushed back on the claim that we don't need f_place data. **He was right, and SwiftCTS's
+own data proves it.**
+
+### MEASURED — SwiftCTS `data/unified_manifest.csv`: 5400 runs, 540 placements × 10 CTS runs
+This is the GAN-CTS structure we lacked. CTS knobs actually swept:
+`cts_max_wire` 130–280, `cts_buf_dist` 70–150, `cts_cluster_size` 12–30, `cts_cluster_dia` 35–70.
+`clock_buffers` spans **84 → 2730 (32.5×)** vs EDA-Schema's knob-invariant behaviour.
+
+**Within-placement (geometry FIXED), CTS knobs move the outcome** — R² per knob:
+
+| target | max_wire | buf_dist | cluster_size | cluster_dia |
+|---|---|---|---|---|
+| clock_buffers | 0.002 | 0.002 | 0.225 | **0.577** |
+| power_total | 0.000 | 0.000 | 0.003 | **0.775** |
+| skew_setup | **0.277** | 0.002 | 0.008 | 0.001 |
+| wirelength | 0.001 | 0.000 | 0.037 | **0.364** |
+
+**And placement is then LOAD-BEARING** (within-design, design mean removed):
+
+| target | CTS knobs alone | + placement knobs | + interaction | **placement adds** |
+|---|---|---|---|---|
+| clock_buffers | 0.599 | 0.723 | 0.755 | **+0.124** |
+| power_total | 0.141 | 0.216 | 0.224 | +0.076 |
+| wirelength | 0.004 | 0.086 | 0.088 | +0.082 |
+| skew_setup | 0.235 | 0.272 | 0.284 | +0.037 |
+
+…and that is with only crude placement KNOBS as a proxy; the real sink geometry lives in
+`def_path`. **Mechanism**: `cts_cluster_dia` is a *max cluster diameter* — a geometric constraint
+that only bites relative to how spread the sinks actually are. `cts_cluster_size` is F_eff and
+`cts_buf_dist` is d_max in `n_buf ≈ max(n_sinks/(F_eff−1), 1.5·√(n·A)/d_max)`. Sweeping them
+moves CTS between the fanout-limited and WL-limited regimes — exactly where geometry matters.
+
+**So: §1's "geometry adds −0.003" is TRUE ONLY for EDA-Schema (CTS knobs pinned). It does not
+generalise.** DECISION TAKEN: sweep CTS knobs (SwiftCTS `hpc/scripts/5-run-cts.py` already does
+it); keep geometry for f_route, don't run it for f_cts-on-EDA-Schema.
+
+---
+
+## 4d. f_place — the real problems, MEASURED (this is where the wins are)
+
+### ❌ ANOTHER FALSE CLAIM CORRECTED: "timing knob response doesn't transfer"
+Said repeatedly. **False.** OLS knob-response ceilings (within-design, 3 raw knobs):
+
+| target | knobs only | +die_area | +√(n·A) | **f_place ACTUAL** |
+|---|---|---|---|---|
+| total_hpwl | 0.719 | **0.857** | 0.858 | +0.654 |
+| buffer_area | 0.429 | 0.530 | 0.540 | +0.474 |
+| buffer_count | 0.387 | 0.472 | 0.474 | +0.595 |
+| **wns** | **0.649** | 0.650 | 0.650 | **−1.102** |
+| **tns** | **0.657** | 0.658 | 0.659 | **−0.126** |
+
+**A 3-knob linear model gets wns 0.649; our GNN gets −1.102 — 1.75 R² WORSE.** The signal is in
+`clock_period` and sitting in the input. Not a data limit — an architecture gap.
+
+**Root cause**: f_place had **no wns/tns head**. They were READOUTS off the per-cell `endpt` head
+— our single worst prediction (pooled R² −0.508, ~100% rel err, calib z² 9.63). We derived timing
+from the broken thing. **FIX**: `wns_g`/`tns_g` are now first-class global targets with
+level+deviation heads and signed-log transform; the dev head already gets raw knobs (DIRECT_KNOB),
+which is where the 0.649 lives.
+
+### MEASURED — `die_area` was missing and is worth ~0.2 R² on tot_hpwl, for free
+All 18 design features were netlist-derived (n_cells, total_cell_area, fanouts…). **Nothing told
+the model how big the die is**, so it had to learn a division. Adding it lifts the tot_hpwl
+ceiling 0.719 → **0.857** while f_place sits at 0.654.
+**Leak-free**: `die = total_cell_area / utilization` is the floorplan identity — cell area from
+synthesis, utilization is a knob, both known BEFORE placement. Verified against the die measured
+from the placed-cell bbox: **R² 0.9961**. Added, with `√(n·A)` (the BHH/Rent law, literature-
+verified as the clock-WL estimator) as an explicit physics prior. `DF_IN` 16 → 18.
+
+### ✅ MEASURED — the f_cts direct-knob A/B (controlled, same data/seed, flag toggled)
+
+| | power | buffers | wns |
+|---|---|---|---|
+| WITHOUT (old f_cts) | +0.108 | **−0.204** | +0.036 |
+| WITH direct knobs | +0.138 | **+0.301** | +0.145 |
+| **delta** | +0.030 | **+0.505** | +0.109 |
+
+Buffers −0.204 → +0.301, **beating the 0.271 OLS ceiling**. wns ~4×. Power moved only +0.030
+against a 0.905 ceiling — **still an open gap worth chasing.**
 
 ---
 
