@@ -165,8 +165,23 @@ def evaluate(model, flows):
     P = {k: [] for k in NET+GLOB+DEVK+DERIV}
     T = {k: [] for k in P}; sig = {k: [] for k in NET+GLOB}; dz = []
     rank_flows = []            # per-FLOW (pred, true) for the ranking metrics — see below
+    geo = {"box_m": [], "box_b": [], "pos_m": [], "pos_b": []}   # GEOMETRY: model vs baseline
+    BASE = norm()["vnbox_m"]                     # train-only mean box — the honest baseline
     for f in flows:
         g = load_graph(f, DEV); o = model(g)
+        # ---- GEOMETRY, scored against the trivial predictor it must beat ----
+        # boxes are die-normalized, so every design is on the same [0,1] scale and one mean box
+        # is a fair baseline. If the model cannot beat it, it has learned no geometry.
+        mv = g["m_vnbox"]
+        if mv.any():
+            pb = o["vn_box"][mv,:,0].cpu().numpy(); tb = g["y_vnbox"][mv].cpu().numpy()
+            geo["box_m"].append(np.abs(pb-tb).mean(1)); geo["box_b"].append(np.abs(BASE[None,:]-tb).mean(1))
+        mp = g["m_pos"]
+        if mp.any():
+            px, py = o["pos_x"][mp,0].cpu().numpy(), o["pos_y"][mp,0].cpu().numpy()
+            tx, ty = g["y_pos_x"][mp].cpu().numpy(), g["y_pos_y"][mp].cpu().numpy()
+            geo["pos_m"].append(np.sqrt((px-tx)**2+(py-ty)**2))
+            geo["pos_b"].append(np.sqrt((tx-.5)**2+(ty-.5)**2))      # baseline: the die centre
         for k, mk, yk in (("net_hpwl","m_net_hpwl","y_net_hpwl"), ("endpt","m_endpt","y_endpt")):
             m = g[mk]
             P[k].append(o[k][m,0].cpu().numpy()); T[k].append(g[yk][m].cpu().numpy())
@@ -313,6 +328,12 @@ def evaluate(model, flows):
             res["net_hpwl"]["auc_top10"]    = float(np.mean(aucs))        # Net2: 92.2 (=0.922)
             res["net_hpwl"]["recall_top10"] = float(np.mean(top_recalls))
             res["net_hpwl"]["bin20_r"]      = float(np.mean(bin_rs)) if bin_rs else float("nan")
+    # GEOMETRY — reported as model-vs-baseline so the run answers "did it learn geometry at all",
+    # with no room for me to read a win into a tie. skill > 0 means it beat the trivial predictor.
+    for tag, mk, bk in (("vn_box", "box_m", "box_b"), ("cell_pos", "pos_m", "pos_b")):
+        if geo[mk]:
+            me = float(np.concatenate(geo[mk]).mean()); be = float(np.concatenate(geo[bk]).mean())
+            res[tag] = dict(err=me, baseline=be, skill=float(1 - me / be) if be > 0 else float("nan"))
     return res
 
 def run_fold(fi, test_designs, all_designs):
@@ -389,6 +410,8 @@ def run_fold(fi, test_designs, all_designs):
               f"hpwl {a_('net_hpwl'):6.2f}um tot {a_('tot_hpwl'):9.0f}um bufA {a_('buf_area'):7.1f}um2 "
               f"bufC {a_('buf_cnt'):5.1f}cells endpt {a_('endpt'):.2f}ns wns {a_('wns'):.2f}ns tns {a_('tns'):7.1f}ns "
               f"| knob-R2 tot {r_('tot_hpwl_dev'):+.2f} bufA {r_('buf_area_dev'):+.2f} bufC {r_('buf_cnt_dev'):+.2f} "
+              f"| GEO skill box {v.get('vn_box',{}).get('skill',float('nan')):+.3f} "
+              f"pos {v.get('cell_pos',{}).get('skill',float('nan')):+.3f} "
               f"| lr {lr_now:.1e} ({time.time()-t0:.0f}s)", flush=True)
         if score > best + 1e-4:
             best, best_state, patience = score, {k:v.detach().cpu().clone() for k,v in model.state_dict().items()}, 0

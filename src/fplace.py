@@ -319,6 +319,21 @@ def set_norm(train_designs, force=False):
             es.append(np.load(p)["ep_slack"])
     es = np.concatenate(es) if es else np.zeros(1, np.float32)
     _NORM["y_endpt_m"] = np.float32(es.mean()); _NORM["y_endpt_s"] = np.float32(es.std() + 1e-6)
+    # GEOMETRY BASELINE (train designs only): the mean VN box. This is the "learned nothing"
+    # predictor the geometry head must BEAT — boxes are normalized by the die, so every design
+    # is already on the same [0,1] scale and a single mean box is a fair, honest baseline.
+    bxs = []
+    for dsg in sorted(train_designs):
+        for p in sorted(glob.glob(f"{ROOT}/cache/coords/{dsg}-*.npz"))[::11][:6]:
+            c = np.load(p); gp = f"{CACHE}/{os.path.basename(p)}"
+            if not os.path.exists(gp): continue
+            d_ = np.load(gp, allow_pickle=True); kp = live_cells(d_)
+            pt = np.asarray(d_["part_cell"])[kp]; _, pt = np.unique(pt, return_inverse=True)
+            x_, y_, mk_ = c["x"][kp], c["y"][kp], c["mask"][kp]
+            for q in range(int(pt.max()) + 1):
+                s = (pt == q) & mk_
+                if s.sum() >= 5: bxs.append((x_[s].min(), y_[s].min(), x_[s].max(), y_[s].max()))
+    _NORM["vnbox_m"] = (np.mean(bxs, 0) if bxs else np.array([.25, .25, .75, .75])).astype(np.float32)
 
     # ---- GLOBAL TARGET DECOMPOSITION:  log(y) = DESIGN LEVEL + KNOB DEVIATION ----
     # THE bug that made within-R2 = -14. We z-scored by the CROSS-design std, but the knob
