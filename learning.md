@@ -440,6 +440,136 @@ This is Barsat's old task #7 ("does the residual beat HPWL?") returning as the r
 
 ---
 
+## 4f. GNN inductive bias — the theory, CITED (and where it corrects us)
+
+### The representational ceiling (VERIFIED)
+- **MPNN ≤ 1-WL** — Xu et al. GIN ICLR'19 Lemma 2; Morris AAAI'19 Thm 1, *for all parameter
+  choices*. No width/depth/training fixes it.
+- **Chen et al. NeurIPS'20 Cor 3.4**: *"MPNNs cannot induced-subgraph-count any connected pattern
+  with 3 or more nodes."* Thm 3.5: they CAN count star-shaped patterns — exactly a 1-hop
+  neighbourhood. **An MPNN counts precisely what one message-passing step sees, and provably
+  nothing more.**
+- **Distance decay**: Topping ICLR'22 Lemma 1 — `|∂h_i^(r+1)/∂x_s| ≤ (αβ)^(r+1)(Â^(r+1))_is`,
+  exponential in distance. Di Giovanni ICML'23 Thm 3.2: width raises the whole curve but "does not
+  target the sensitivity of specific node pairs" — **the local:distant RATIO is invariant**.
+  Thm 4.1 shallow ⇒ decay; **Thm 4.2 deep ⇒ vanishing gradients. Depth is a pincer, not an escape.**
+- Di Giovanni TMLR'24: required depth scales with **commute time**, "as large as O(n³)".
+- **The citation that states our thesis** (Di Giovanni ICML'23 §5.5(i)): *"When the task only
+  depends on local interactions, the property of MPNN of reducing the sensitivity to messages from
+  nodes with high commute time can be beneficial since it decreases harmful redundancy."*
+
+### ⚠️ Where the theory CORRECTS our diagnosis
+- **WNS/TNS FIT the theory.** WNS = min over endpoints of slack along **long timing paths** = high
+  mixing at high commute time. Theory predicts failure; we measured **−1.102**. ✓
+- **total_hpwl does NOT fit the theory.** `tot_hpwl = Σ_net HPWL_net` — a smooth aggregate of
+  LOCAL quantities, squarely inside the 1-WL-decomposable class. Theory says a GNN should do
+  **fine**. We get per-net AUC **0.912** but tot_hpwl **0.654**. ⇒ **The failure is in the
+  AGGREGATION / absolute-scale / cross-design normalisation, NOT the representation.** Do not
+  blame inductive bias for this one.
+- **"Pooling destroys global info" is NOT supported.** Mesquita NeurIPS'20: plain global **mean
+  pooling ties** DiffPool/Graclus/GMN — incl. **0.443±0.03 on ZINC, a graph-level scalar
+  regression**; random cluster assignments beat DiffPool. GNNs learn low-pass filters early, so
+  embeddings are near-homogeneous *before* pooling. The real theoretical case against mean readout
+  is **Xu Cor 8** (non-injective, blind to size/multiplicity), not Mesquita.
+- **Alon & Yahav** attribute the *short-range* depth ceiling to **over-smoothing**; over-squashing
+  explains **long-range** failure only. (We had this backwards.)
+
+### (b) Does EDA use graphs for GLOBAL scalars? **No — and that is a finding**
+- **DE-HNN (AISTATS'24 — not NeurIPS)**: its three tasks are net-HPWL regression, net-demand
+  regression, cell-congestion classification. **All net/cell level. Zero global scalars, no
+  graph-level readout.**
+- Net2 per-net; CongestionNet per-cell; **GRANNITE per-gate toggle rates, then a conventional
+  engine applies `P = Σ α·C·V²·f`**; TimingGCN/PreRoutGNN per-pin slack (not WNS).
+- **CircuitGNN (NeurIPS'22)** readout taxonomy enumerates Cell-, Net-, Grid-level. **Graph-level
+  is absent from the design space.**
+- Global scalars go to **CNN-on-image** (GAN-CTS ResNet-50 → clock power/WL/skew; RouteNet
+  ResNet-18 → #DRV). Knob→PPA DSE uses **GP/RF/XGBoost/BO**; the 2021 ML-for-EDA survey's P&R
+  prediction row lists "SVM, CNN, GAN, MARS, Random Forest" — **GNN absent**.
+- **THE DECISIVE ONE — MasterRTL (ICCAD'23)** predicts *exactly our targets* (WNS, TNS, power,
+  area). Verbatim: *"we implemented a Graph Convolutional Network (GCN) … and one sum-pooling
+  layer. It performs an end-to-end graph-level value regression."* … *"**the XGBoost regressor is
+  more accurate than the GCN model.** … Therefore, the traditional tree-based model is finally
+  adopted."* Final: WNS R=0.93, TNS R=0.96, power R=0.89, area R=0.98 — **with trees, not
+  pooling.** **Our GNN-loses-on-global-scalars result is a PUBLISHED result.**
+
+### (c) Physics baseline + learned residual — the pattern to copy
+The EDA literature here is **thin (that is itself a finding)**: EDA PINNs exist only where a PDE
+does (thermal, EM, Maxwell). Explicit analytic-prior + learned-residual for *design-metric*
+prediction is **unoccupied ground**.
+- **GRANNITE pattern (strongest)**: ML fills the unknown term *inside an exact equation* — physics
+  cannot be violated. <5.5% error, 18.7× speedup.
+- **PowerNet** states our argument verbatim: *"design-dependent information should be preprocessed
+  to correlate with IR drop before feeding to ML models"* — explicitly for unseen-design transfer.
+- **Δ-ML (JCTC 2015), all VERIFIED, all actionable:**
+  - **Smoothness beats accuracy in a prior.** PBE0 had >2 eV raw error vs ZINDO's 0.78 — yet gave
+    the *better* Δ-model (<0.1 vs 0.23 eV): *"more sophisticated baseline models, albeit
+    occasionally leading to more substantial errors … are smoother … and therefore easier to
+    learn."* **A biased-but-smooth HPWL/RUDY prior is a GOOD prior.**
+  - **Do NOT tune the prior's constants.** Reparameterised PM7's advantage "vanishes beyond 1k
+    training"; reparameterised Benson was *worse* than direct ML. Let the residual eat the bias.
+  - **The prior buys a vertical offset in the learning curve that persists** — i.e. ≈ a fixed
+    multiple of designs. That is exactly the currency we lack (18 graphs).
+  - Hybrid modelling (Materials 2021): at 20% data, hybrid MSE ≈30 vs pure-ANN ≈1717 (**~57×**).
+    **The residual advantage GROWS as data shrinks — our regime.**
+- ⚠️ **Our `sqrt(n*A)` prior has the WRONG FORM.** `HPWL_total ~ √(A·N)` is **not established** —
+  it is only the **p=0.5 special case** of `√A·N^p`. Donath: `L ∝ G^(p−0.5)`, **p∈[0.5,0.75]
+  VERIFIED**, ~2× overestimate VERIFIED. At real p≈0.6–0.75 our form **under-scales**.
+  `N(l) ∝ l^(2p−3)` is VERIFIED (Davis/Meindl TED'98; Stroobandt) and being *distributional* fits
+  **per-net** prediction, not a total-HPWL prior.
+
+### (d) When NOT to use a GNN
+1. Global scalar dominated by knobs.
+2. **Sample size**: graph-level N = #designs (**18** for us); per-net N = #nets (**millions**).
+   Same encoder, ~5 orders of magnitude difference in effective samples.
+3. When the task needs substructure counting beyond 1-WL — Chen Cor 3.4 makes it *impossible*.
+4. **Virtual nodes will NOT save the readout at our scale.** Cai ICML'23 (the usual VN
+   justification): MPNN+VN approximates a **linear** transformer at O(1) width; full self-attention
+   needs **O(n^d)** — vacuous at n≈1M. "Distinguished in Uniform" (2405.11951): GT and MPNN+VN are
+   both non-uniform-universal and **incomparable** — and generalising across designs of different
+   sizes **is** the uniform setting. Southern ICLR'25: VN sensitivity to distinct node features is
+   "often uniform" ⇒ **a VN readout degenerates toward a learned mean.**
+5. Alon's own proxy: on ENZYMES the topology-free "No Struct" baseline scores **65.2±6.4 vs GIN's
+   59.6±5.6** — the structure-agnostic baseline beats the GNN outright.
+
+### DE-HNN's VN, from its own PDF
+Justification: *"standard message-passing GNNs have difficulty to capture long-range interaction
+due to over-smoothing, over-squashing and under-reaching"*; VN *"effectively reduces the graph
+diameter to 2."* **But its authors undercut the global readout**: *"since the features of all nodes
+have to be aggregated at the virtual node, **the aggregated messages will lose sensitivity to
+individual node features. The benefits of adding a single VN thus diminishes as the graph becomes
+larger.**"* Ablation: single VN **+1.0%**; two-level Metis VN hierarchy +3.4%.
+Also: DE-HNN cross-design demand Pearson **0.372** vs **0.723** single-design — **cross-design
+collapse is universal**, consistent with `fplace-timing-is-coverage-limited`.
+
+### ⚠️ The likeliest cause is SAMPLE SIZE, not inductive bias (agent's blunt read, INFERENCE)
+Per-net HPWL gives ~10⁶ labels. Global scalars give **one label per (design × knob-config)** — and
+since `G_D ⟂ k`, the LEVEL task has just **18**. "A 3-parameter OLS at n≈10² will beat a
+multi-million-parameter net that sees ~10² effective targets, *regardless* of architecture."
+Before blaming the representation, check whether the global target is a 1-WL-computable aggregate
+of short-range quantities — if it is, the theory says the GNN should be **fine**, and the culprit
+is n. **tot_hpwl is exactly such a target.**
+**WNS is additionally an EXTREME-ORDER STATISTIC** (min over endpoints) — the worst possible case
+for mean-pooling and for any smoothed representation.
+
+### ⚠️ Δ-ML lesson we were about to get wrong
+Feeding the model **only the prior's scalar output** → R² 81.88%. Feeding it the prior's
+**dimensional derivation inputs too** (A, N, p, utilization) → **R² 99.15%**.
+**Give the model (A, N, p, util), not just the prior's number.** Note our `dfeat` now carries
+`log(die_area)` and already carried `log(n_cells)` — so a linear head can form **any** `α·logA +
+β·logN`, i.e. it can LEARN p rather than have our (wrong) p=0.5 imposed. Keep both.
+
+### ⇒ THE ARCHITECTURE THIS FORCES
+**Kill the pooled global heads; compose globals ANALYTICALLY from per-node predictions.**
+`tot_hpwl = Σ_net HPWL_net` is an **identity, not a model**. We already predict per-net HPWL at
+AUC 0.912 with N = #nets (millions) instead of 18. This is exactly GRANNITE's verified
+architecture. **Under test now.**
+For WNS/TNS: theory says a pooled MPNN readout cannot get there (min-over-long-paths). Feed
+`(clock_period, utilization, aspect_ratio, die_area, N, p)` straight to the head — never through
+the VN — and let the GNN predict the **residual**. Consistent with our `VN_KNOBS=0` result and the
+LOSTIN note (knob supernode 40.7% MAPE vs late-concat 3.11%).
+
+---
+
 ## 5. Open questions / decisions needed
 
 1. **HYPOTHESIS (under test)**: f_cts's dev heads had **no direct knob path** — knobs reached
