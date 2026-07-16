@@ -635,6 +635,74 @@ raises the achievable ceiling; it is NOT yet evidenced as a model win.
 
 ---
 
+## 4h. 🛑 PROTOCOL AUDIT — most of my local claims were not admissible
+
+Barsat: *"idk how are you determining but i hope its fair by doing small local run."* It was not.
+
+### The probes vs the cluster
+
+| | local probes | cluster | factor |
+|---|---|---|---|
+| train flows | 182 | 756 | **4.2× less** |
+| dim / layers | d=48 / K=3 | d=64 / K=4 | ~2× smaller |
+| epochs | 20–24 | 200 | **10× less** |
+| test designs | sasc/systemcdes/ac97 | fold-specific | **different split** |
+| checkpoint | max over epochs **on TEST** | val-design based | **test peeking** |
+
+**The smoking gun** — same code, same target, setup alone: cluster tot_hpwl knob-R² **+0.654**,
+probe **−0.708**. **A 1.36 R² swing with no model change.**
+
+⇒ **A probe can support only a WITHIN-PROBE A/B (same setup both arms). It can never be compared
+to a cluster number or to an OLS fit on different data.** Claims I made that violate this:
+- "wns −1.102 → +0.586" (cluster vs probe) ✗
+- "the sum gets 17.4% vs the pooled head's 52%" (probe vs cluster) ✗ — the *valid* figure is
+  17.4% vs **112.7%**, both in-probe.
+- "f_cts 0.139 vs OLS 0.419" (probe vs OLS on 4× data) ✗
+
+### 🛑 WORSE: the baseline was contaminated with LOCKED OOD designs
+`OOD_DESIGNS = [jpeg, aes_core, tv80, wb_dma, i2c]` — never trained on, touched once at the end.
+**My OLS baseline (and every local probe) trained on `aes_core` and `i2c`.** The "honest baseline"
+had MORE designs than the model it was beating. Soft-leaks the OOD set into architecture choices.
+
+### ✅ THE LEGITIMATE BASELINE — exact cluster fold-0 split, raw knobs, no OOD
+train `[ethernet, mem_ctrl, pci, simple_spi, ss_pcm, systemcaes, usb_phy]` → test
+`[ac97_ctrl, sasc, systemcdes, usb_funct]`:
+
+| target | raw knobs | +die+crit | GNN (fold0) | verdict |
+|---|---|---|---|---|
+| total_hpwl | 0.702 | 0.702 | +0.654 | baseline wins |
+| buffer_area | 0.386 | 0.386 | **+0.474** | **GNN WINS** |
+| buffer_count | 0.447 | 0.447 | **+0.595** | **GNN WINS** |
+| wns | 0.091 | 0.118 | **−1.102** | baseline wins badly |
+| tns | 0.118 | 0.183 | −0.126 | baseline wins |
+
+### ❌ RETRACTION #4: `die_area` adds NOTHING to knob response — and it never could
+0.702 → 0.702. **Within a design, `log(die) = log(cell_area) − log(util)` and `cell_area` is
+design-constant ⇒ `log(die)` is `−log(util)` plus a constant: PERFECTLY COLLINEAR with a knob the
+model already has.** My "ceiling 0.719 → 0.857" came from the contaminated split + the cheating
+centered knob. It may still help the *level* (cross-design, where cell_area varies) — untested.
+
+### ❌ RETRACTION #5: `crit_path`'s gain is much smaller than claimed
+wns 0.091 → **0.118**, tns 0.118 → **0.183** — not 0.143 → 0.419. Consistent with the probe
+showing no model gain at all.
+
+### What actually survives, on a fair split
+1. **The GNN earns its keep on buffer_area (+0.09) and buffer_count (+0.15) over the baseline.**
+2. **wns/tns are the real failure**: −1.102 vs a trivial 0.091. Readout-off-broken-endpt is the
+   named cause; `wns_g` heads are the untested fix.
+3. **tot_hpwl is a wash** (0.654 vs 0.702) — exactly what analytic composition should fix.
+4. **f_cts direct-knob A/B** (buffers −0.204 → +0.301) — same setup both arms ⇒ **admissible**.
+5. **sum vs pool** (17.4% vs 112.7% rel-err, in-probe) — same setup both arms ⇒ **admissible**.
+6. **The graph is identical across knob configs** (cell_x drift 0.0000) — a data fact, not a
+   training claim ⇒ admissible.
+
+### RULE going forward
+- Local probes: **A/B only**, both arms identical, never quoted against cluster/OLS numbers.
+- Any baseline must use the **exact fold split** and **never touch OOD_DESIGNS**.
+- No "best over epochs on TEST" — select on val, report on test.
+
+---
+
 ## 5. Open questions / decisions needed
 
 1. **HYPOTHESIS (under test)**: f_cts's dev heads had **no direct knob path** — knobs reached
