@@ -15,6 +15,13 @@ cache/*
 # double jump host is not workable. So it ships via git. Kept small on purpose (float16, 43MB).
 # Everything else under cache/ stays untracked — it can be rebuilt from the dataset in place.
 !cache/coords/
+# EXCEPTION 2 — cache/fp_arrival, same reason, WORSE. It is derived from
+# datasets/sky130hd/timing_paths (30GB — ten times the gates table that already forced this
+# exception). scripts/add_fp_arrival.py cannot run on the cluster: the table is not there.
+# It is 2.5MB — 18x smaller than coords — so shipping it is free.
+# CAUGHT BY: seam_2x2's own guard, which would have hard-failed every job at second 5
+# (NC=0 != NG=1944). The guard worked; the cache plan did not.
+!cache/fp_arrival/
 venv/
 *.tar.gz
 
