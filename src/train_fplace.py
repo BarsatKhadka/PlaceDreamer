@@ -69,6 +69,7 @@ W = dict(net_hpwl=float(E("W_NETHPWL", 5)),        # dense: ~10k nets/flow
          # other globals; the dev head already gets the raw knobs (DIRECT_KNOB), which is
          # exactly where that 0.649 lives.
          wns_g=float(E("W_WNS", 1)), tns_g=float(E("W_TNS", 1)),
+         ndly=float(E("W_NDLY", 3)), cdly=float(E("W_CDLY", 1)),   # timing rebuild step 1
          hpwl_sum=float(E("W_HPWL_SUM", 3)),   # calibrates per-net preds to the true total
          # GEOMETRY WEIGHTS. These were 5 and 5, chosen with NO justification, which made
          # geometry 68.2% of the whole loss (W_POS x2 terms + W_VNBOX x4 terms = 30/44) while
@@ -145,6 +146,11 @@ def flows_of(designs):
 def wloss(out, g, nll=True):
     L = (W["net_hpwl"] * gnll(out["net_hpwl"], g["y_net_hpwl"], g["m_net_hpwl"], nll)
        + W["endpt"]    * gnll(out["endpt"],    g["y_endpt"],    g["m_endpt"], nll))
+    # TIMING REBUILD step 1 — per-net / per-gate delay. ndly weighted above cdly because net delay
+    # is 414x cell delay at global_place: pre-route, WIRE delay IS the timing.
+    if "ndly" in out:
+        L = L + W["ndly"] * gnll(out["ndly"], g["y_ndly"], g["m_ndly"], nll)
+        L = L + W["cdly"] * gnll(out["cdly"], g["y_cdly"], g["m_cdly"], nll)
     # PLACEMENT GEOMETRY — the densest target we have (every cell, ~100% coverage). This is what
     # the seam actually needs to carry: CTS is a function of where the sinks landed, not of a
     # scalar total-HPWL. Weighted like net_hpwl (both are dense per-node structure).
@@ -182,7 +188,7 @@ def wloss(out, g, nll=True):
 def evaluate(model, flows):
     """collect predictions vs truth for every target."""
     model.eval()
-    NET  = ("net_hpwl", "endpt")                       # per-node (masked) heads: net & endpoint
+    NET  = ("net_hpwl", "endpt") + (("ndly", "cdly") if fplace.TIMING_HEADS else ())
     GLOB = ("tot_hpwl","buf_area","buf_cnt")           # per-flow scalars (level + deviation)
     DEVK = tuple(k+"_dev" for k in GLOB)               # the KNOB RESPONSE, scored on its own
     DERIV = ("wns","tns")                              # NOT heads — read out from endpt per flow
@@ -207,7 +213,10 @@ def evaluate(model, flows):
             tx, ty = g["y_pos_x"][mp].cpu().numpy(), g["y_pos_y"][mp].cpu().numpy()
             geo["pos_m"].append(np.sqrt((px-tx)**2+(py-ty)**2))
             geo["pos_b"].append(np.sqrt((tx-.5)**2+(ty-.5)**2))      # baseline: the die centre
-        for k, mk, yk in (("net_hpwl","m_net_hpwl","y_net_hpwl"), ("endpt","m_endpt","y_endpt")):
+        _pairs = [("net_hpwl","m_net_hpwl","y_net_hpwl"), ("endpt","m_endpt","y_endpt")]
+        if fplace.TIMING_HEADS:
+            _pairs += [("ndly","m_ndly","y_ndly"), ("cdly","m_cdly","y_cdly")]
+        for k, mk, yk in _pairs:
             m = g[mk]
             P[k].append(o[k][m,0].cpu().numpy()); T[k].append(g[yk][m].cpu().numpy())
             sig[k].append(o[k][m,1].cpu().numpy())
@@ -367,6 +376,17 @@ def evaluate(model, flows):
                 if m_.sum() >= 3: bp.append(pf[m_].mean()); bt.append(tf[m_].mean())
             if len(bt) >= 5 and np.std(bt) > 1e-9 and np.std(bp) > 1e-9:
                 bin_rs.append(float(np.corrcoef(bp, bt)[0, 1]))
+    # WITHIN-DESIGN R2 for the delay heads. A pooled per-net R2 mixes cross-NET spread (easy:
+    # long nets are slow) with the knob response (hard). The linear floor we must beat was measured
+    # cross-net WITHIN one flow: +0.343/+0.184/+0.080/+0.214 from [log hpwl, log fanout] -> ~0.20.
+    # Report BOTH so the comparison is honest and nobody quotes the flattering one.
+    for k in ("ndly", "cdly"):
+        if k in res and k in P and len(P[k]):
+            pp, tt = np.concatenate(P[k]), np.concatenate(T[k])
+            ok = np.isfinite(pp) & np.isfinite(tt)
+            if ok.sum() > 50 and tt[ok].std() > 1e-9:
+                res[k]["r2_pooled_allnets"] = float(1 - ((tt[ok]-pp[ok])**2).sum()
+                                                    / ((tt[ok]-tt[ok].mean())**2).sum())
         if aucs and "net_hpwl" in res:
             res["net_hpwl"]["auc_top10"]    = float(np.mean(aucs))        # Net2: 92.2 (=0.922)
             res["net_hpwl"]["recall_top10"] = float(np.mean(top_recalls))

@@ -149,6 +149,20 @@ TARGETS        = LOG_TARGETS
 # 20x the rest — the highest-leverage nets in our best head (AUC 0.912). The rollup explains
 # 323/323 = 100% of them. Fix the cause, don't delete the symptom. See add_net_family.py.
 NET_TARGET   = os.environ.get("NET_TARGET", "own")       # own | family
+# TIMING REBUILD, STEP 1 — the FAIL-FAST head (scripts/add_arc_delay.py).
+# Our timing is broken cross-design: TEST fold 0 endpt r2 -0.382, wns within_r2 -0.720 (i.e. WITHIN
+# a design, as knobs move, worse than that design's own mean = ZERO knob signal). And the signal is
+# real: within-design corr(place_wns, FINAL wns) = +0.796. So we capture none of a 63% opportunity.
+# Before building the levelized chain (2-3 weeks), train ONE head on per-net delay and see.
+# BOUNDS, measured, so nobody promises TimingGCN's +0.8957 off this:
+#   * linear R2 on log net delay from [log hpwl, log fanout] = +0.343/+0.184/+0.080/+0.214,
+#     median ~0.20. That is the FLOOR a GNN must beat (it sees driver type + topology; a linear
+#     probe does not). Even adding post-place cap+slew LABELS only reaches ~0.38.
+#   * supervision gain is ~1.2x-9.3x (median ~2x) over our current endpoints — NOT section 6's 48x.
+#   * TimingGCN predicts POST-PLACEMENT ("Pre-Routing Slack Prediction"): they MEASURE net length
+#     from coordinates. We predict it (AUC 0.912, rel-err 45%). Our timing is bounded by that.
+# If h_net_delay cannot beat ~0.20 within-design, the chain is dead and we spent a day, not weeks.
+TIMING_HEADS = bool(int(os.environ.get("TIMING_HEADS") or "0"))   # h_net_delay + h_cell_delay
 ENDPT_TARGET = os.environ.get("ENDPT_TARGET", "slack")   # slack | arrival | delta
 WNS_HEAD = bool(int(os.environ.get("WNS_HEAD") or "1"))
 # A/B FLAG. crit_path = clock_period - fp_wns = the design TIMING SCALE theta(G_D).
@@ -382,6 +396,8 @@ def REQUIRED_NORM_KEYS():
     IF YOU ADD A KEY TO set_norm THAT load_graph READS, ADD IT HERE."""
     k = ["cx_m", "cx_s", "nx_m", "nx_s", "df_m", "df_s",
          "y_endpt_m", "y_endpt_s", "fpa_m", "fpa_s"]
+    if TIMING_HEADS:
+        k += ["y_ndly_m", "y_ndly_s", "y_cdly_m", "y_cdly_s"]
     for t in TARGETS:
         k += [f"y_{t}_m", f"y_{t}_s"]
     for t in GLOBAL_TARGETS:
@@ -501,6 +517,18 @@ def set_norm(train_designs, force=False):
             z = np.load(p); fa.append(z["fp_arrival"][z["mask"]])
     fa = np.concatenate(fa) if fa else np.zeros(1, np.float32)
     _NORM["fpa_m"] = np.float32(fa.mean()); _NORM["fpa_s"] = np.float32(fa.std() + 1e-6)
+    # PER-NET / PER-GATE DELAY stats (train designs only). log-space: delay is positive and spans
+    # orders of magnitude (net delay median 0.414 ns vs cell delay 0.001 ns — 414x).
+    if TIMING_HEADS:
+        for key, arr_k, msk_k in (("ndly", "net_delay", "net_mask"), ("cdly", "cell_delay", "cell_mask")):
+            v = []
+            for dsg in sorted(train_designs):
+                for p_ in sorted(glob.glob(f"{ROOT}/cache/arc_delay/{dsg}-*.npz"))[::11][:10]:
+                    z = np.load(p_); a = z[arr_k][z[msk_k]]
+                    a = a[np.isfinite(a) & (a > 0)]
+                    if len(a): v.append(np.log(a))
+            v = np.concatenate(v) if v else np.zeros(1, np.float32)
+            _NORM[f"y_{key}_m"] = np.float32(v.mean()); _NORM[f"y_{key}_s"] = np.float32(v.std() + 1e-6)
     # FLOORPLAN GEOMETRY feature stats (train designs only) — see load_graph. die = cell_area/util
     # and sqrt(n*A) are both pre-placement, so these are inputs, not leakage.
     _m = meta()                       # NOTE: m_all is only bound further down; use meta() here
@@ -859,6 +887,18 @@ def load_graph(flow_id, device="cpu"):
     _nh = np.asarray(_nh_target, np.float64)
     _ok = np.asarray(_nh_mask, bool)
     g["y_hpwl_sum"] = float(np.log(_nh[_ok].sum())) if _ok.any() else float("nan")
+    # PER-NET / PER-GATE DELAY targets. Both VERIFIED well-defined (within-net std across paths
+    # 0.0000 ns; within-gate 0.0000) — one net has ONE delay whichever path traverses it.
+    if TIMING_HEADS:
+        _ad = np.load(f"{ROOT}/cache/arc_delay/{flow_id}.npz")
+        for key, arr_k, msk_k, sel in (("ndly", "net_delay", "net_mask", None),
+                                       ("cdly", "cell_delay", "cell_mask", keep)):
+            a = _ad[arr_k]; mk = _ad[msk_k]
+            if sel is not None: a, mk = a[sel], mk[sel]
+            ok = mk & np.isfinite(a) & (a > 0)
+            y = np.zeros(len(a), np.float32)
+            y[ok] = (np.log(a[ok]) - float(nm[f"y_{key}_m"])) / float(nm[f"y_{key}_s"])
+            g[f"y_{key}"] = t(y); g[f"m_{key}"] = t(ok, torch.bool)
     g["wns_true"] = float(m.wns); g["tns_true"] = float(m.tns)
     g["clock_period_raw"] = float(m.clock_period)   # for the arrival->slack identity
     return {k: (v.to(device) if torch.is_tensor(v) else v) for k, v in g.items()}
@@ -1071,6 +1111,14 @@ class FPlace(nn.Module):
         # per-ENDPOINT slack head (per-cell). WNS=min, TNS=sum-neg are READOUTS, not heads.
         # ctx skip so clock_period + the floorplan anchor reach each endpoint's slack directly.
         self.h_endpt = Linear(256, 2)
+        # TIMING REBUILD step 1. Per-NET delay reads the same per-net embedding as h_net_hpwl
+        # (our AUC-0.912 head); per-GATE delay reads the per-cell embedding. Deliberately the
+        # SIMPLEST possible version: no schedule, no max-channel, no propagation. This exists to
+        # answer ONE question in a day — can we predict delay at all above the ~0.20 linear floor?
+        self.timing_heads = TIMING_HEADS
+        if TIMING_HEADS:
+            self.h_ndly = Linear(256, 2)      # per-net  delay (mu, logvar), log ns
+            self.h_cdly = Linear(256, 2)      # per-gate delay (mu, logvar), log ns
         # per-cell PLACEMENT GEOMETRY head -> normalized (x, y) in [0,1], each (mu, logvar).
         # WHY: the seam measured that forwarding placement SUMMARY metrics changed nothing for
         # f_cts (imagined == real), because CTS is driven by WHERE THE SINKS LANDED -- sink
@@ -1167,6 +1215,9 @@ class FPlace(nn.Module):
         o = dict(net_hpwl=self.h_net_hpwl(hn),
                  endpt=self.h_endpt(hc),             # per-cell slack; WNS/TNS read out in train
                  )
+        if self.timing_heads:
+            o["ndly"] = self.h_ndly(hn)              # per-net  delay — same embedding as net_hpwl
+            o["cdly"] = self.h_cdly(hc)              # per-gate delay
         if self.geo_heads:
             o["pos_x"], o["pos_y"] = p[:, 0:2], p[:, 2:4]    # each (mu, logvar)
             o["vn_box"] = self.h_vnbox(vb).view(-1, 4, 2)    # [nvn, 4 coords, (mu, logvar)]
