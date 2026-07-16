@@ -485,7 +485,7 @@ This is Barsat's old task #7 ("does the residual beat HPWL?") returning as the r
 - Global scalars go to **CNN-on-image** (GAN-CTS ResNet-50 → clock power/WL/skew; RouteNet
   ResNet-18 → #DRV). Knob→PPA DSE uses **GP/RF/XGBoost/BO**; the 2021 ML-for-EDA survey's P&R
   prediction row lists "SVM, CNN, GAN, MARS, Random Forest" — **GNN absent**.
-- **THE DECISIVE ONE — MasterRTL (ICCAD'23)** predicts *exactly our targets* (WNS, TNS, power,
+- **THE DECISIVE ONE — MasterRTL (ICCAD'23)** predicts *exactly our targets* (WNS, TNS, power,i m
   area). Verbatim: *"we implemented a Graph Convolutional Network (GCN) … and one sum-pooling
   layer. It performs an end-to-end graph-level value regression."* … *"**the XGBoost regressor is
   more accurate than the GCN model.** … Therefore, the traditional tree-based model is finally
@@ -737,6 +737,82 @@ calibrated in ABSOLUTE terms (ranking alone will not sum to the right total).
 **The architecture principle transfers across all three stages**, which is the encouraging part:
 *GNN for per-node structure; identity/physics for composition; raw knobs direct to the deviation
 head.* All four f_route flag combos verified to build and train.
+
+---
+
+## 4j. MasterRTL, read from the SOURCE (paperCodes/MasterRTL) — the biggest architectural lesson
+
+Barsat: *"they do so similar to us"*. Correct, and reading the code (not the abstract) overturned
+my wns work.
+
+### What MasterRTL actually is (VERIFIED from the repo)
+`ML_model/train/train.py` is four lines: `xgb.XGBRegressor(n_estimators=25, max_depth=12)`.
+**25 trees.** All the intelligence is upstream, in the features. And `saved_model/` ships
+`xgboost_{WNS,TNS,Power,Area}_model.pkl` — trees, for exactly our targets. 90 designs (we have 18).
+
+### The three-level hierarchy — and OUR "BUG" IS THEIR ARCHITECTURE
+`feature_extract/timing/feature_extra_graph_STA.py`:
+```python
+rfr = train_rfr()                                    # RandomForest(50, depth 30) — PER-PATH delay
+delay_list_all, wns_list = graphProc.Graph_STA(rfr, design_name)      # STA over the graph
+feat_timing = cal_timing(delay_list_all)             # -> [wns_pred, tns_pred]
+# then: XGBoost(14 design feats + those 2 numbers) -> WNS/TNS
+```
+`graph_stat.py: cal_timing`:
+```python
+require_time_array = require_time - output_delay     # require_time IS THE CLOCK PERIOD
+arrival_time_array = delay_sum + input_delay
+slack_array = require_time_array - arrival_time_array
+slack_array[slack_array>0] = 0
+tns = np.sum(slack_array);  wns = np.min(slack_array)   # <- IDENTITIES
+```
+
+| level | MasterRTL | us |
+|---|---|---|
+| 1. per-path/endpoint delay | RandomForest — **accurate** | `endpt` head — **pooled R² −0.508, BROKEN** |
+| 2. aggregate | `min` / `sum` — identity | **same identity** ✓ (our "readout") |
+| 3. **correct the aggregate** | **XGBoost(design feats + [wns,tns])** | **absent** |
+
+🛑 **So our WNS/TNS readout IS MasterRTL's architecture, and my `wns_g` "direct head" fix is
+BACKWARDS.** The defect was never the readout — it is (a) level 1 is broken and (b) level 3
+does not exist.
+
+### ⇒ THE REAL FIX: predict ARRIVAL, not SLACK
+`slack = require_time − arrival` is **additive in raw ns**, and `require_time` is the clock period.
+So:
+- **arrival is STRUCTURAL** — a property of the graph, and MEASURED design-constant: implied
+  `arrival = clock_period − wns` has a within-design relative std of **0.065** (p90 0.096).
+- ⇒ `slack = clock_period − arrival` lets the **knob enter by ARITHMETIC**, not learning.
+- ⇒ **the GNN never needs to learn a timing knob response at all.** It predicts arrival from
+  structure (constant in k — exactly what a graph is for); the knob is applied exactly.
+
+Our `endpt` head predicts **slack**, forcing it to learn the clock_period dependence AND the
+structure simultaneously. Retargeting it to **arrival** (we can build the label: `arrival =
+clock_period − endpoint_slack`, per endpoint) is the principled change. **HYPOTHESIS, untested.**
+
+### ❌ And `fp_wns` is NOT the prior to correct (measured)
+| | wns | tns |
+|---|---|---|
+| zero-param `y = fp_*` (cluster metric) | **−6.845** | −10.941 |
+| + global shift fit on train designs | −9.692 | −2621.99 |
+| corr(fp, y) | 0.444 (R² 0.198) | 0.532 (R² 0.283) |
+| placement moves y by | median **+1.271 ns**, IQR [−0.29, +4.60] | median +181 ns |
+
+Placement does **real** timing work (median +1.27 ns improvement) — the floorplan estimate is not
+a prior you merely correct. So MasterRTL's step-3-on-fp_wns does not transfer; their prior is
+computed from a *path model*, which is the thing we must fix instead.
+
+### 🛑 RETRACTION #6 — I do not know the wns bar. Both my baselines were invalid.
+- The **0.091** figure un-standardizes using **the TEST design's own mean and std** — unavailable
+  at inference. It cheats.
+- The **raw-ns** physics baseline scores **−4.647** because `wns = clock_period − arrival(DESIGN)`
+  and a linear model has **no design term**, so the intercept is wrong on a held-out design.
+- The transform is not cosmetic: for **tns**, raw-ns R² is **0.146** vs signed-log **0.641**.
+  `slack` is additive in ns; signed-log turns an exact law into a nonlinear one.
+
+**⇒ The legitimate bar requires predicting `arrival(design)` — i.e. it is not a knob baseline at
+all.** Every wns number I quoted today (−1.102 vs 0.091, "worse than a 3-knob linear model") is
+withdrawn pending a correctly-specified baseline.
 
 ---
 
