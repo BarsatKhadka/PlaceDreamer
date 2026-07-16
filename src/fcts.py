@@ -36,8 +36,9 @@ def set_seam(mode, place_model=None):
     _SEAM["mode"] = mode; _SEAM["place_model"] = place_model
 def seam_dims():
     on = _SEAM["mode"] is not None
+    # each placement global crosses as TWO channels (level, deviation) -- see seam._glob_lvl_dev
     return dict(cell=(1 if on else 0), net=(1 if on else 0),
-                df=(len(seam.PLACE_GLOBAL) if on else 0))
+                df=(2 * len(seam.PLACE_GLOBAL) if on else 0))
 
 CTS_GLOBAL = ("cts_buffers", "cts_power")     # level + knob-deviation (like tot_hpwl/buf_area)
 CTS_TIMING = ("cts_wns", "cts_tns")           # signed; level + deviation

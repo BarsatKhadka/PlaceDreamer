@@ -58,13 +58,31 @@ def real_place_state(flow_id, g, device="cpu"):
     m = fplace.meta().loc[flow_id]
     raws = dict(tot_hpwl=np.log(max(m.total_hpwl,1e-6)), buf_area=np.log(max(m.buffer_area,0)+1),
                 buf_cnt=np.log(max(getattr(m,'buffer_count',np.nan),0)+1))
-    glob = torch.tensor([_gval(nm, k, raws[k]) for k in PLACE_GLOBAL], dtype=torch.float)
+    glob = torch.tensor(_glob_lvl_dev(nm, flow_id, raws), dtype=torch.float)
     return dict(net=net_hpwl.to(device), cell=cell_slack.to(device), glob=torch.nan_to_num(glob).to(device))
 
-def _gval(nm, k, raw):
-    """standardize a global with f_place's level/deviation-free z (uses the level stats)."""
-    m_, s_ = float(nm.get(f"L_{k}_m", 0.0)), float(nm.get(f"L_{k}_s", 1.0))
-    return (raw - m_) / s_
+def _glob_lvl_dev(nm, flow_id, raws):
+    """Forward each global as TWO channels: level and deviation, each at UNIT scale.
+
+    THE BUG THIS FIXES: a single channel (raw_log - L_m)/L_s standardizes by the CROSS-DESIGN
+    spread L_s. But the knob response only spans W (the WITHIN-design spread), and W/L_s is
+    0.055 / 0.026 / 0.019 for tot_hpwl / buf_area / buf_cnt -- so the knob signal arrived
+    compressed 18x / 38x / 53x under design identity and f_cts could not see it. This is the
+    same level-vs-deviation normalization trap that cost f_place -14.7 R2 before it was split.
+    Splitting restores the knob response to scale ~1, where it is actually visible:
+        level     = (mu_design - L_m) / L_s     -> WHICH design (design identity)
+        deviation = (raw_log - mu_design) / W_d -> WHAT THE KNOBS DID  <- the agent needs this
+    f_place already predicts exactly these two quantities, so imagined mode forwards its
+    {k}_lvl and {k}_dev heads directly -- same spaces, no rescaling.
+    """
+    dsg = flow_id.rsplit("-", 1)[0]; out = []
+    for k in PLACE_GLOBAL:
+        L_m, L_s = float(nm[f"L_{k}_m"]), float(nm[f"L_{k}_s"])
+        i = int(np.where(nm[f"MU_{k}_keys"] == dsg)[0][0])
+        mu_d = float(nm[f"MU_{k}_vals"][i]); w_d = float(nm[f"W_{k}_vals"][i])
+        out.append((mu_d - L_m) / L_s)              # level
+        out.append((raws[k] - mu_d) / max(w_d, 1e-3))  # deviation -- unit scale, knob response
+    return out
 
 # ---------------------------------------------------------------------------
 # IMAGINED placement state — f_place's OWN outputs on this flow.
@@ -75,7 +93,10 @@ def imagined_place_state(flow_id, g, place_model, device="cpu"):
     o = place_model(g)
     net  = torch.nan_to_num(o["net_hpwl"][:, 0])     # per-net predicted HPWL
     cell = torch.nan_to_num(o["endpt"][:, 0])        # per-cell predicted endpoint slack
-    glob = torch.stack([o[f"{k}_lvl"][0] for k in PLACE_GLOBAL])  # level-standardized, matches real
+    # Level AND deviation, forwarded as separate unit-scale channels -- see _glob_lvl_dev.
+    # f_place's heads already emit these in exactly the spaces real mode builds, so the two
+    # modes are directly comparable and the knob response is NOT crushed by cross-design scale.
+    glob = torch.stack([o[f"{k}_{p}"][0] for k in PLACE_GLOBAL for p in ("lvl", "dev")])
     return dict(net=net.to(device), cell=cell.to(device),
                 glob=torch.nan_to_num(glob).to(device))
 
