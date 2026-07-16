@@ -9,7 +9,12 @@ picorv32/runs/
 *.log
 paperCodes/
 datasets/
-cache/
+cache/*
+# EXCEPTION — cache/coords is the one cache that is NOT regenerable everywhere: it is derived
+# from datasets/sky130hd/gates (2.8GB), which is not on the cluster, and rsync through the
+# double jump host is not workable. So it ships via git. Kept small on purpose (float16, 43MB).
+# Everything else under cache/ stays untracked — it can be rebuilt from the dataset in place.
+!cache/coords/
 venv/
 *.tar.gz
 

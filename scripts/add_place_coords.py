@@ -60,8 +60,13 @@ for di, d in enumerate(designs):
         W, H = max(x1 - x0, 1e-6), max(y1 - y0, 1e-6)
         xn = np.where(ok, (cx - x0) / W, 0.5)           # fill non-coord cells with die centre
         yn = np.where(ok, (cy - y0) / H, 0.5)
+        # float16, deliberately: this is the ONE cache the cluster cannot regenerate (the 2.8GB
+        # `gates` table is not there, and rsync through the double jump host is not workable), so
+        # it ships via git and has to be small. f32 -> 92MB, f16 -> 43MB. Coords are normalized
+        # to [0,1], where f16 resolves ~0.0005 of the die; model errors are ~0.2, so quantization
+        # sits 400x below the signal and costs nothing.
         np.savez_compressed(f"{OUT}/{fid}.npz",
-                            x=xn.astype(np.float32), y=yn.astype(np.float32),
+                            x=xn.astype(np.float16), y=yn.astype(np.float16),
                             mask=ok, die_w=np.float32(W), die_h=np.float32(H))
         tot_cells += ok.sum(); tot_missing += (~ok).sum(); tot_flows += 1
     print(f"[{di+1:2}/{len(designs)}] {d:14} {len(fids):4} flows", flush=True)
