@@ -494,6 +494,16 @@ def load_graph(flow_id, device="cpu"):
         mask[ep_idx] = True
     g["y_endpt"] = t(y_ep); g["m_endpt"] = t(mask, torch.bool)
     g["ep_idx"] = torch.tensor(ep_idx, dtype=torch.long)         # labeled endpoint cells
+    # per-cell PLACEMENT GEOMETRY targets: normalized (x, y) in [0,1] at place_resized.
+    # Stored full-length (aligned to cell_names) like cache/cts, so [keep] compacts them the
+    # same way every other per-cell array is compacted. NOT standardized: the target is already
+    # a bounded fraction of the die, and the die itself moves with the knobs, so [0,1] IS the
+    # canonical frame. mask is False only for cells with no coordinate (tapcells -> dropped by
+    # keep anyway), so coverage on the kept cells is ~100%.
+    pc_ = np.load(f"{ROOT}/cache/coords/{flow_id}.npz")
+    g["y_pos_x"] = t(pc_["x"][keep].astype(np.float32))
+    g["y_pos_y"] = t(pc_["y"][keep].astype(np.float32))
+    g["m_pos"]   = t(pc_["mask"][keep], torch.bool)
     # raw recorded WNS/TNS — for eval readout comparison (complete, untruncated)
     g["wns_true"] = float(m.wns); g["tns_true"] = float(m.tns)
     return {k: (v.to(device) if torch.is_tensor(v) else v) for k, v in g.items()}
@@ -698,6 +708,16 @@ class FPlace(nn.Module):
         # per-ENDPOINT slack head (per-cell). WNS=min, TNS=sum-neg are READOUTS, not heads.
         # ctx skip so clock_period + the floorplan anchor reach each endpoint's slack directly.
         self.h_endpt = Linear(256, 2)
+        # per-cell PLACEMENT GEOMETRY head -> normalized (x, y) in [0,1], each (mu, logvar).
+        # WHY: the seam measured that forwarding placement SUMMARY metrics changed nothing for
+        # f_cts (imagined == real), because CTS is driven by WHERE THE SINKS LANDED -- sink
+        # spread sets clock wirelength, which sets buffer count and clock power. A scalar
+        # total-HPWL cannot express that; coordinates can. Verified learnable: adjacent knob
+        # configs place the same cell at corr x/y 0.97/0.92 (the placer is deterministic, so
+        # this is not the PE sign-ambiguity trap), while the aspect_ratio knob reorganizes the
+        # layout (sasc corr y 0.92 -> 0.13 as the die goes AR 2.08 -> 0.68) -- so geometry
+        # CARRIES the knob response the summary globals were crushing 18-53x.
+        self.h_pos = Linear(256, 4)                 # [mu_x, logvar_x, mu_y, logvar_y]
 
     def encode_pe(self, pe):
         """SignNet: rho( concat_i [ phi(v_i) + phi(-v_i) ] ). Invariant to v_i -> -v_i by
@@ -752,8 +772,10 @@ class FPlace(nn.Module):
         dev_in = [h.mean(0), h.max(0).values, h_net.mean(0), h_net.max(0).values, ctx]
         if self.direct_knob: dev_in.append(g["knobs"])
         hd = self.fc1_dev(torch.cat(dev_in))
+        p = self.h_pos(hc)                           # per-cell normalized (x, y) geometry
         o = dict(net_hpwl=self.h_net_hpwl(hn),
-                 endpt=self.h_endpt(hc))             # per-cell slack; WNS/TNS read out in train
+                 endpt=self.h_endpt(hc),             # per-cell slack; WNS/TNS read out in train
+                 pos_x=p[:, 0:2], pos_y=p[:, 2:4])   # each (mu, logvar) -> gnll like every head
         for k in GLOBAL_TARGETS:                     # level + knob-deviation, both O(1)
             o[f"{k}_lvl"] = self.h_lvl[k](hg)        # design level: pooled graph (~n_cells)
             o[f"{k}_dev"] = self.h_dev[k](hd)        # knob response: knobs go in DIRECTLY

@@ -62,6 +62,7 @@ W = dict(net_hpwl=float(E("W_NETHPWL", 5)),        # dense: ~10k nets/flow
          endpt=float(E("W_ENDPT", 3)),             # dense: ~700 endpoints/flow
          tot_hpwl=float(E("W_TOT", 1)), buf_area=float(E("W_BUFA", 1)),
          buf_cnt=float(E("W_BUFC", 1)),
+         pos=float(E("W_POS", 5)),                 # dense: EVERY cell — placement GEOMETRY
          dev=float(E("W_DEV", 3)))                 # knob-DEVIATION weight (the thing we want)
 torch.manual_seed(SEED); random.seed(SEED); np.random.seed(SEED)
 os.makedirs(OUT, exist_ok=True)
@@ -128,6 +129,12 @@ def flows_of(designs):
 def wloss(out, g, nll=True):
     L = (W["net_hpwl"] * gnll(out["net_hpwl"], g["y_net_hpwl"], g["m_net_hpwl"], nll)
        + W["endpt"]    * gnll(out["endpt"],    g["y_endpt"],    g["m_endpt"], nll))
+    # PLACEMENT GEOMETRY — the densest target we have (every cell, ~100% coverage). This is what
+    # the seam actually needs to carry: CTS is a function of where the sinks landed, not of a
+    # scalar total-HPWL. Weighted like net_hpwl (both are dense per-node structure).
+    if "y_pos_x" in g:
+        L = L + W["pos"] * (gnll(out["pos_x"], g["y_pos_x"], g["m_pos"], nll)
+                          + gnll(out["pos_y"], g["y_pos_y"], g["m_pos"], nll))
     # global targets: LEVEL + knob DEVIATION, both O(1). The deviation is up-weighted because
     # it IS the thing f_place exists to predict — the level is ~n_cells and nearly free.
     for k in GLOBAL_TARGETS:
