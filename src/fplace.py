@@ -97,7 +97,19 @@ def meta():
 #     50% on wb_dma, where the min-readout is consequently wrong). OPEN.
 LOG_TARGETS    = ("net_hpwl", "tot_hpwl", "buf_area", "buf_cnt")
 TARGETS        = LOG_TARGETS
-GLOBAL_TARGETS = ("tot_hpwl", "buf_area", "buf_cnt", "wns_g", "tns_g")
+# A/B FLAG. WNS_HEAD=0 reproduces the SHIPPED model (WNS/TNS exist only as READOUTS off the
+# per-cell endpt head). WNS_HEAD=1 gives them real level+deviation heads.
+# Fair-split evidence (cluster fold 0, raw-knob baseline, no OOD): the shipped readout scores
+# wns -1.102 / tns -0.126 while a 3-knob OLS gets 0.091 / 0.118 — the model is WORSE THAN
+# TRIVIAL, and endpt (its source) is our worst head (pooled R2 -0.508). This flag is the fix.
+WNS_HEAD = bool(int(os.environ.get("WNS_HEAD") or "1"))
+# A/B FLAG. crit_path = clock_period - fp_wns = the design TIMING SCALE theta(G_D).
+# Fair-split gain is SMALL: wns 0.091 -> 0.118, tns 0.118 -> 0.183 (not the 0.143 ->
+# 0.419 first claimed, which came from a contaminated split). A probe showed NO model
+# gain (+0.001). Flagged so the cluster decides rather than me.
+CRIT_KNOB = bool(int(os.environ.get("CRIT_KNOB") or "1"))
+KNOB_DIM  = 5 + (1 if CRIT_KNOB else 0)   # clk, util, AR, fp_wns, fp_tns [, crit_path]
+GLOBAL_TARGETS = (("tot_hpwl", "buf_area", "buf_cnt") + (("wns_g", "tns_g") if WNS_HEAD else ()))
 # each -> a LEVEL head + a DEVIATION head.
 #
 # wns_g/tns_g ADDED — and this is the biggest measured miss in f_place. WNS/TNS used to exist
@@ -236,7 +248,13 @@ IDENT_CELL = [_c[i] for i in _IDENT_CELL_RAW]
 LOG_DF     = [_f[i] for i in _LOG_DF_RAW]
 IDENT_DF   = [_f[i] for i in _IDENT_DF_RAW]
 CELL_IN    = len(KEEP_CELL) + 10          # 12 library + 10 PE = 22
-DF_IN      = len(KEEP_DF) + 2             # 16 netlist + 2 floorplan geometry
+# A/B FLAG. GEO_FEATS=0 reproduces the shipped 16 netlist-only design features.
+# MEASURED (fair fold-0 split, no OOD): die_area adds NOTHING to knob response
+# (0.702 -> 0.702) and never could — within a design log(die)=log(cell_area)-log(util)
+# and cell_area is design-constant, so it is COLLINEAR with the utilization knob.
+# Kept flagged only because it may still help the cross-design LEVEL (untested).
+GEO_FEATS  = bool(int(os.environ.get("GEO_FEATS") or "1"))
+DF_IN      = len(KEEP_DF) + (2 if GEO_FEATS else 0)   # 16 netlist + 2 floorplan geometry
                                           # (log die_area, log sqrt(n*A) physics prior)
 PE_SLICE   = slice(len(KEEP_CELL), CELL_IN)   # the 10 PE dims, post-drop
 
@@ -526,7 +544,7 @@ def load_graph(flow_id, device="cpu"):
     _geo = np.array([(np.log(_die)          - nm["g_die_m"])  / nm["g_die_s"],
                      (0.5*np.log(max(float(np.asarray(d["df_vals"])[0]),1.0) * _die)
                                             - nm["g_snA_m"])  / nm["g_snA_s"]], np.float32)
-    dfeat = np.concatenate([dfeat, _geo])
+    if GEO_FEATS: dfeat = np.concatenate([dfeat, _geo])
     # knobs + FLOORPLAN-TIMING ANCHOR (fp_wns/fp_tns). The anchor gives the model the
     # design's baseline timing LEVEL — the part that doesn't transfer cross-design and
     # tanked WNS to R²=-0.77 without it. Leakage-free: floorplan is BEFORE placement.
@@ -550,8 +568,8 @@ def load_graph(flow_id, device="cpu"):
     # not just the prior: R2 81.88% -> 99.15%).
     crit = max(float(m.clock_period) - float(m.fp_wns), 1e-3)
     a_crit = (np.log(crit) - nm["k_crit_m"]) / nm["k_crit_s"]
-    knb = np.array([kz("clock_period"), kz("utilization"), kz("aspect_ratio"),
-                    a_wns, a_tns, a_crit], np.float32)   # all 6 unit-variance, zero-mean
+    knb = np.array(([kz("clock_period"), kz("utilization"), kz("aspect_ratio"), a_wns, a_tns]
+                    + ([a_crit] if CRIT_KNOB else [])), np.float32)   # unit-variance, zero-mean
     # VN partition, compacted to the surviving cells. Re-densify the partition ids: dropping
     # tapcells can empty a partition, and scatter(dim_size=max+1) would leave a hole.
     pc = np.asarray(d["part_cell"])[keep]
@@ -759,7 +777,8 @@ class BipartiteConv(nn.Module):
 ENCODERS = {"dehnn", "dehnn_novn", "dehnn_undirected", "sage", "gat"}
 
 class FPlace(nn.Module):
-    def __init__(self, d=64, K=4, cell_in=CELL_IN, net_in=NET_IN, knob=6, dfeat=DF_IN, encoder="dehnn"):
+    def __init__(self, d=64, K=4, cell_in=CELL_IN, net_in=NET_IN, knob=None, dfeat=DF_IN, encoder="dehnn"):
+        knob = knob if knob is not None else KNOB_DIM   # follows CRIT_KNOB
         super().__init__()
         assert encoder in ENCODERS, f"unknown encoder {encoder}; pick from {ENCODERS}"
         self.encoder = encoder

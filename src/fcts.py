@@ -40,7 +40,7 @@ def seam_dims():
     return dict(cell=(1 if on else 0), net=(1 if on else 0),
                 df=(2 * len(seam.PLACE_GLOBAL) if on else 0))
 
-KNOB = 6                                      # raw knob vector width (matches fplace):
+KNOB = fplace.KNOB_DIM                                      # raw knob vector width (matches fplace):
 # clock_period, utilization, aspect_ratio, fp_wns, fp_tns, crit_path(=period-fp_wns).
 # crit_path is theta(G_D), the design's TIMING SCALE — measured to lift the achievable
 # knob-response ceiling cts_power 0.143->0.419 and cts_wns 0.121->0.372 (held-out).
