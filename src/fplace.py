@@ -376,6 +376,19 @@ def _pe_norm(pe):
     rms = np.sqrt((pe ** 2).mean(0, keepdims=True))
     return pe / (rms + 1e-8)
 
+def REQUIRED_NORM_KEYS():
+    """Every key load_graph will index out of the norm. The manifest a cached norm is checked
+    against, so a forgotten NORM_VERSION bump self-heals instead of dying inside load_graph.
+    IF YOU ADD A KEY TO set_norm THAT load_graph READS, ADD IT HERE."""
+    k = ["cx_m", "cx_s", "nx_m", "nx_s", "df_m", "df_s",
+         "y_endpt_m", "y_endpt_s", "fpa_m", "fpa_s"]
+    for t in TARGETS:
+        k += [f"y_{t}_m", f"y_{t}_s"]
+    for t in GLOBAL_TARGETS:
+        k += [f"MU_{t}_keys", f"MU_{t}_vals", f"W_{t}_vals", f"DEG_{t}_vals"]
+    return k
+
+
 def set_norm(train_designs, force=False):
     """Build feature + target normalization from TRAINING designs ONLY.
 
@@ -401,7 +414,24 @@ def set_norm(train_designs, force=False):
         # Loading them without it raises "Object arrays cannot be loaded when allow_pickle=False",
         # so ANY run that hits an existing norm cache dies — e.g. re-running a fold, or f_cts
         # reusing the norm f_place just built for the same train split.
-        _NORM = dict(np.load(f, allow_pickle=True)); return _NORM
+        _cand = dict(np.load(f, allow_pickle=True))
+        # SELF-HEAL. NORM_VERSION only invalidates stale caches IF SOMEONE REMEMBERS TO BUMP IT,
+        # and the comment above says exactly that — then commit dc92bf7 ("THE FREE PRIOR") added
+        # fpa_m/fpa_s to this function and did NOT bump it. A v4 cache written before fpa_m existed
+        # still keyed as v4, loaded clean, and killed a 9-job cluster array 20 minutes in with
+        #     KeyError: 'fpa_m'   at fplace.py:600, deep inside load_graph
+        # i.e. the precise failure the comment predicts: "fail far away with a confusing KeyError".
+        # Version discipline is a process fix for a code problem. So: CHECK, don't trust. A cache
+        # missing any key this build needs is stale by definition — rebuild it, loudly, and cost
+        # 60s instead of a queue slot.
+        _need = REQUIRED_NORM_KEYS()
+        _miss = [k for k in _need if k not in _cand]
+        if _miss:
+            print(f"[norm] STALE cache {os.path.basename(f)} missing {_miss[:6]}"
+                  f"{'...' if len(_miss) > 6 else ''} -> REBUILDING (someone added a key without "
+                  f"bumping NORM_VERSION={NORM_VERSION})", flush=True)
+        else:
+            _NORM = _cand; return _NORM
 
     cx, nx, df, ynh = [], [], [], []
     for dsg in sorted(train_designs):                       # stratified: every train design
