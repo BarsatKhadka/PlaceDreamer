@@ -893,6 +893,79 @@ pooled R² −0.508, and hence WNS (read off it) at −1.102.
 
 ---
 
+## 4l. 🛑 RETRACTION #8 — THE COMPOUNDING SIGN. Imagined may BEAT real.
+
+I have said all session that the seam's imagined path should be WORSE than real, and called the
+gap "compounding". **Two papers measured the opposite.**
+
+**MasterRTL §IV.A (ICCAD'23)** chains a tree on its OWN predictions to predict post-placement PPA
+(*"features are simply from the existing MasterRTL predictions"*). vs post-place ground truth:
+
+| feature source | WNS | TNS | Power |
+|---|---|---|---|
+| **DC Syn — the REAL netlist** | R=0.94, MAPE **51%** | R=0.97, MAPE **62%** | R=0.65 |
+| **chained on PREDICTED** | R=0.92, MAPE **27%** | R=0.89, MAPE **4%** | **R=0.88** |
+
+Their words: chained predictions *"achieve similar or even higher accuracy than ground-truth logic
+synthesis results."* **Chaining through an IMAGINED intermediate BEAT using the real one.**
+
+**PowPrediCT (DAC'24, Yibo Lin)** — our direct structural predecessor (placement → post-route power
+with a dedicated CTS-surrogate phase). Phase 1 pretrain on post-route graphs → Phase 2 a GNN
+predicts clock power from placement graphs with NO CTS info → **Phase 3 swap the input to placement
+graphs and FINE-TUNE**. Cross-design leave-one-out, 7 CircuitNet netlists, total power avg rel err:
+
+| Innovus @ place | Vanilla GNN | **Phase 1 only** | **PowPrediCT (1→3)** |
+|---|---|---|---|
+| 9.652% | **14.149%** *(worse than the tool!)* | **5.106%** | **1.981%** |
+
+**Phase-1-only → full = 2.6×, purely from calibrating to the early-stage (imagined) input.**
+**That is teacher forcing → student forcing. They reinvented scheduled sampling and never named it.**
+
+**MECHANISM**: the downstream model learns to invert the upstream model's SYSTEMATIC BIAS — which
+it cannot do if you only ever show it clean input it will never see at test time.
+
+⇒ **Our dual-eval 2×2 is not measuring damage. It is measuring whether training-on-imagined HELPS.**
+
+| | eval real | eval imagined |
+|---|---|---|
+| **train real** | teacher-forced ceiling | the naive seam |
+| **train imagined** | — | **the fix — PowPrediCT says this wins** |
+
+⇒ **ADOPT PowPrediCT's SCHEDULE, not just its endpoint**: pretrain teacher-forced on real state,
+THEN fine-tune on imagined. Do NOT train from scratch on imagined. Their 1→3 ordering is
+load-bearing and it is a cheap A/B for us.
+
+## 4m. The transformer question — MEASURED, and the answer is no
+
+Barsat asked whether a transformer would help. **MasterRTL tried it on OUR targets and dropped it**
+(their Fig. 5): **WNS — Transformer 0.19 vs Random Forest 0.87**; **Power — GCN 0.48 vs XGBoost
+0.73.** Against TimingPredict's per-node result (structured GNN **+0.8957** vs vanilla GCNII
+**−1.5101**), the rule is measured, not argued:
+
+> **It is INDUCTIVE BIAS, not architecture family.** GNN for the per-node state; identities for
+> composition; a small model on the aggregate. No transformer.
+
+(Theory agrees: Cai ICML'23 — MPNN+VN ≈ a LINEAR transformer at O(1) width, full attention needs
+O(n^d), vacuous at our n. "Distinguished in Uniform" — GT and MPNN+VN are both non-uniform-universal
+and INCOMPARABLE, and generalising across design sizes IS the uniform setting.)
+
+## 4n. The novelty surface — VERIFIED NEGATIVE
+Exhaustive arXiv full-text + DBLP: `"world model" AND "physical design"` → **0**;
+`"model-based RL" AND "EDA"` → **0**; `"Dreamer" AND "EDA"` → **0**. **"Exposure bias" and
+"teacher forcing" appear NOWHERE in this literature.**
+- **Agnesina/Lim (ML-for-Systems @ NeurIPS'20) PROPOSED our exact staged formulation** — per-stage
+  state and reward, macro→placement→(WL, slack, power, congestion) — and never built it; their
+  environment stayed the real tool. **That is the opening, and it is Lim's own group.**
+- **Agnesina ICCAD'20 / TCAD'23**: the only published account of surrogate exploitation in PD —
+  *"our trained network did not achieve superior performance to the MAB if used in this fashion."*
+  Cite as motivation for the grounding loop.
+- **FastTuner (ISPD'24) is NOT a staged model** — a design-conditioned bandit. Its GNN embedding is
+  a **7-entry lookup table** (7 designs, graph constant across knobs — our F1, confirmed in the
+  wild). Estimator eval is **within-design only**, Pearson-only, **no cross-design number**.
+  **But its Table 6 is a gift**: all > CTS+route > route on **7/7 designs**, i.e. locking placement
+  knobs costs **12–34 TNS points**. Independent industrial evidence that f_place is load-bearing —
+  in a competitor's paper.
+
 ## 5. Open questions / decisions needed
 
 1. **HYPOTHESIS (under test)**: f_cts's dev heads had **no direct knob path** — knobs reached
