@@ -816,6 +816,83 @@ withdrawn pending a correctly-specified baseline.
 
 ---
 
+## 4k. TimingGCN (DAC'22) — the blueprint for our worst head, and we HAVE the data
+
+Read from source: `paperCodes/TimingPredict` (Guo, Lin et al., DAC'22).
+
+### Their architecture — a timing ENGINE, built structurally (VERIFIED, model.py)
+```python
+class TimingGCN:
+    self.nc1 = NetConv(10, 2, 32); self.nc2 = NetConv(32, 2, 32); self.nc3 = NetConv(32, 2, 16)
+    self.prop = SignalProp(10 + 16, 8, 7, 8, 4)
+def forward(self, g, ts, groundtruth=False):
+    x = self.nc1(g, ts, nf0); x = self.nc2(...); x = self.nc3(...)
+    net_delays = x[:, :4]                                   # a GNN predicts NET DELAY (local)
+    nf2, cell_delays = self.prop(g, ts, cat([nf0, x]), groundtruth=groundtruth)   # then PROPAGATE
+```
+`SignalProp.forward` is **levelized topological propagation**, not synchronous message passing:
+```python
+assert len(ts['topo']) % 2 == 0, 'The number of logic levels must be even (net, cell, net)'
+g.apply_nodes(self.node_skip_level_o, ts['pi_nodes'])          # seed level 0 = primary inputs
+for i in range(1, len(ts['topo'])):
+    if i % 2 == 1: prop_net(ts['topo'][i], groundtruth)
+    else:          prop_cell(ts['topo'][i], groundtruth)
+```
+and the cell step is literally STA's max-over-fanin:
+```python
+g.send_and_recv(es, fn.copy_e('efc1','efc1'), fn.sum('efc1','nfc1'), etype='cell_out')
+g.send_and_recv(es, fn.copy_e('efc2','efc2'), fn.max('efc2','nfc2'), etype='cell_out')   # MAX
+g.apply_nodes(self.node_reduce_o, nodes)     # MLP over [nf, sum, max]
+```
+
+### DEEP SUPERVISION — the thing we do not do (VERIFIED, train_gnn.py:98-112)
+```python
+loss_net_delays  = F.mse_loss(pred_net_delays,  g.ndata['n_net_delays_log'])   # per-NET delay (LOG)
+loss_cell_delays = F.mse_loss(pred_cell_delays, g.edges['cell_out'].data['e_cell_delays'])  # per-EDGE
+loss_ats         = F.mse_loss(pred_atslew,      g.ndata['n_atslew'])           # per-PIN arrival+slew
+(loss_net_delays + loss_cell_delays + loss_ats).backward()
+```
+They supervise **every intermediate physical quantity**. Plain MSE, no NLL. We supervise only the
+final slack and expect a synchronous GNN to discover STA by itself — with ~700 labels.
+
+### They already have OUR SEAM, inside one model (VERIFIED, train_gnn.py:123-124)
+```python
+pred_..., pred_atslew      = model(g, ts, groundtruth=True)    # TEACHER-FORCED
+_,        pred_atslew_prop = model(g, ts, groundtruth=False)   # PROPAGATED
+```
+`groundtruth=True` skips propagation and uses true upstream arrivals. **That is exactly our
+real-vs-imagined dual-eval**, at the timing-graph level. We invented it independently; they ship it.
+
+### ✅ WE HAVE THE DATA — all of it (VERIFIED)
+| table | columns | = TimingGCN's target |
+|---|---|---|
+| `net_arcs` | `delay, arrival_time, slew, capacitance`, startpoint→endpoint | `n_net_delays_log` |
+| `cell_arcs` | `delay, arrival_time, slew, gate_name`, startpoint→endpoint | `e_cell_delays` |
+| `pins` | `setup_rise_slack/slew`, `load_capacitance` | `n_atslew` |
+| `timing_paths` | `arrival_time, required_time, slack` | the identity |
+
+`startpoint`/`endpoint` on the arc tables **IS the timing DAG**. Per flow (ac97-000001,
+place_resized): **37,609 cell arcs + 37,641 net arcs + 5,041 pins ≈ 75k supervision points** —
+vs the **~700** endpoint slacks we train on today. **~100× more signal, already in the dataset.**
+
+MEASURED — the identity holds to storage precision: `max|(required − arrival) − slack| = 1e-3 ns`
+(= 1 ps; values are stored to ~3-4 dp). (My first check called it violated by using a 1e-6
+threshold — that was my error, not the data's.)
+
+### ⇒ THE CHAIN, and why our endpt head is broken
+MEASURED at place_resized: **net delay median 0.32 ns vs cell delay median 0.0001 ns** — pre-routing,
+**wire delay IS the timing**, and wire delay is a function of net length, the head we are ALREADY
+good at (AUC 0.912).
+```
+net HPWL  ->  net delay  ->  arrival (propagate, max over fanin)  ->  slack = clock_period - arrival  ->  WNS = min
+  ✅ 0.912      new head          STA structure                            arithmetic                     identity
+```
+Every step after the first is a supervised local quantity or an identity. **The GNN never learns
+timing globally.** Our single slack head is asked to do all of it at once from 700 labels — hence
+pooled R² −0.508, and hence WNS (read off it) at −1.102.
+
+---
+
 ## 5. Open questions / decisions needed
 
 1. **HYPOTHESIS (under test)**: f_cts's dev heads had **no direct knob path** — knobs reached
