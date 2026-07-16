@@ -614,6 +614,25 @@ raw knobs directly, while dfeat only arrives smeared through `ctx` and K message
 Fed explicitly rather than derived, per Δ-ML (give the prior's derivation inputs: 81.88% → 99.15%).
 f_cts inherits it free, since it reuses f_place's `load_graph`.
 
+### ❌ …BUT THE MODEL DOES NOT USE IT. Negative result, 182-flow probe:
+
+| | power | buffers | wns |
+|---|---|---|---|
+| f_cts before | +0.138 | +0.301 | +0.145 |
+| f_cts **+crit_path** | +0.139 | +0.307 | **+0.096** |
+
+**+0.001 / +0.006 / −0.049.** Nothing, and wns got *worse*. **A LINEAR CEILING GOING UP DOES NOT
+MEAN THE MODEL FOLLOWS IT** — this is the same species of error as the three retractions above,
+one step removed: I nearly sold the feature on an OLS number without checking the model.
+
+**The gap is now the finding**: OLS(raw knobs + crit_path) = **0.419**; f_cts with the *same
+inputs* = **0.139**. A linear model extracts 3× more from identical information. Either
+(a) the probe is underpowered (182 flows / d=48 / 20 ep vs OLS fit on 756 — not a clean
+comparison), or (b) f_cts genuinely fails to exploit a feature a linear model uses trivially,
+which would point at the deviation head/optimisation rather than the features.
+**HYPOTHESIS, untested.** The cluster run decides. The feature is kept because it is leak-free and
+raises the achievable ceiling; it is NOT yet evidenced as a model win.
+
 ---
 
 ## 5. Open questions / decisions needed
