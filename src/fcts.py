@@ -21,9 +21,23 @@ SINK-SPECIFIC READOUT: clock metrics are functions of the SINKS, not all cells, 
 import os, glob, numpy as np, pandas as pd, torch, torch.nn as nn, torch.nn.functional as F
 from torch.nn import Sequential as Seq, Linear, LeakyReLU
 import sys; sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-import fplace
+import fplace, seam
 from fplace import (FPlace, meta, norm, set_norm as _set_norm_place, load_graph as _load_place,
-                    ROOT, _pre, _slog, gnll)
+                    ROOT, _slog, gnll)
+
+# THE SEAM SWITCH. mode=None -> standalone f_cts (no placement state).
+#   "real"     -> teacher forcing: consume the REAL placement state from EDA-Schema.
+#   "imagined" -> consume f_place's PREDICTION. The gap between the two final errors is the
+#                 compounding we measure. The model is IDENTICAL in both; only the input differs.
+# When the seam is on, the model gains: +1 cell feature (placement slack), +1 net feature
+# (placement HPWL), +len(PLACE_GLOBAL) design features (placement globals).
+_SEAM = {"mode": None, "place_model": None}
+def set_seam(mode, place_model=None):
+    _SEAM["mode"] = mode; _SEAM["place_model"] = place_model
+def seam_dims():
+    on = _SEAM["mode"] is not None
+    return dict(cell=(1 if on else 0), net=(1 if on else 0),
+                df=(len(seam.PLACE_GLOBAL) if on else 0))
 
 CTS_GLOBAL = ("cts_buffers", "cts_power")     # level + knob-deviation (like tot_hpwl/buf_area)
 CTS_TIMING = ("cts_wns", "cts_tns")           # signed; level + deviation
@@ -40,13 +54,23 @@ def load_graph(flow_id, device="cpu"):
     act = c["activity"][keep]
     nm = norm()
     act_z = (act - nm["cts_act_m"]) / nm["cts_act_s"]
-    # INSERT the two CTS features into the LIBRARY block (before the PE slice), not at the end —
-    # the encoder splits cell_x at PE_SLICE.start into [library | PE], and PE must stay the last
-    # 10 dims for SignNet. So cell_x goes [lib(12) | CTS(2) | PE(10)] and PE_SLICE shifts by 2.
-    extra = torch.tensor(np.stack([is_sink, act_z], 1), dtype=torch.float, device=device)
+    # CTS cell features: is_sink, activity. Plus, IF the SEAM is active, f_place's per-cell
+    # placement state (endpoint slack) — real (teacher-forced) or imagined (f_place's prediction).
+    cell_extra = [is_sink, act_z]
+    if _SEAM["mode"] is not None:
+        ps = seam.place_state(flow_id, g, _SEAM["mode"], _SEAM["place_model"], device)
+        g["_place_state"] = ps                                   # net + glob injected below
+        cell_extra.append(np.asarray(ps["cell"].cpu()))          # per-cell placement slack
+    extra = torch.tensor(np.stack(cell_extra, 1), dtype=torch.float, device=device)
+    # INSERT into the LIBRARY block (before PE) — PE must stay the last 10 dims for SignNet.
     cx = g["cell_x"]
     lib, pe = cx[:, :fplace.PE_SLICE.start], cx[:, fplace.PE_SLICE.start:]
     g["cell_x"] = torch.cat([lib, extra, pe], 1)
+    if _SEAM["mode"] is not None:
+        # inject per-net placement HPWL into net_x, and the placement globals into dfeat
+        ps = g["_place_state"]
+        g["net_x"] = torch.cat([g["net_x"], ps["net"].unsqueeze(1)], 1)
+        g["dfeat"] = torch.cat([g["dfeat"], ps["glob"]], 0)
     g["sink_mask"] = torch.tensor(is_sink > 0.5, dtype=torch.bool, device=device)
     m = meta().loc[flow_id]
     # targets, decomposed level+deviation exactly like f_place's global targets
@@ -61,12 +85,9 @@ def load_graph(flow_id, device="cpu"):
         g[f"w_{k}"] = w_d; g[f"deg_{k}"] = bool(nm[f"DEG_{k}_vals"][i]); g[f"y_{k}"] = yv
     return g
 
-CELL_IN_CTS = None   # set after first set_norm (fplace CELL_IN + 2)
-
 def set_norm(train_designs, force=False):
     """f_place norm (features + its targets) PLUS the CTS additions (activity stats, and the
     level/deviation decomposition for the 4 CTS targets). Reuses f_place's set_norm wholesale."""
-    global CELL_IN_CTS
     _set_norm_place(train_designs, force=force)
     nm = fplace._NORM
     # activity normalization (train designs only; sample a few flows each — per-flow files now)
@@ -90,7 +111,6 @@ def set_norm(train_designs, force=False):
         nm[f"W_{k}"] = np.float32(w_d[tr].mean()+1e-6)
         nm[f"DEG_{k}_keys"] = np.array(w_d.index); nm[f"DEG_{k}_vals"] = (w_d < 0.03).values
         nm[f"MU_{k}_keys"] = np.array(mu_d.index); nm[f"MU_{k}_vals"] = mu_d.values.astype(np.float32)
-    CELL_IN_CTS = fplace.CELL_IN + 2
     return nm
 
 def recon(k, lvl, dev, nm, w=None):
@@ -102,15 +122,15 @@ class FCTS(nn.Module):
     """f_place's encoder (reused, +2 CTS cell features) + a SINK-SPECIFIC readout + CTS heads."""
     def __init__(self, d=64, K=4, encoder="dehnn"):
         super().__init__()
-        # the encoder is FPlace's — but cell_in is +2 for the CTS features. We build a full
-        # FPlace to reuse encode(); its own heads exist but are unused (cheap, and keeps ONE
-        # tested code path). cell_in override via fplace.CELL_IN is set in set_norm.
-        self.enc = FPlace(d=d, K=K, cell_in=CELL_IN_CTS, encoder=encoder)
-        # cell_x is [lib(12) | CTS(2) | PE(10)]. The encoder splits at self.enc.pe_start into
-        # [library-block | PE]. Point it AFTER the 2 CTS features so the library MLP sees
-        # lib+CTS (14 dims) and SignNet sees the last 10 (PE). node_encoder was built for
-        # cell_in - n_pe = CELL_IN_CTS - 10 = 14 inputs, which matches.
-        self.enc.pe_start = fplace.PE_SLICE.start + 2
+        sd = seam_dims()                        # extra dims when the seam is on (else 0)
+        n_cell_extra = 2 + sd["cell"]           # is_sink, activity (+ placement slack if seam)
+        # cell_x = [lib(12) | CTS-extra | PE(10)]. Build the encoder for that width and point
+        # its PE split AFTER the extra features so SignNet still sees the last 10 dims as PE.
+        cell_in = fplace.CELL_IN + n_cell_extra
+        net_in  = fplace.NET_IN + sd["net"]
+        dfeat   = fplace.DF_IN + sd["df"]
+        self.enc = FPlace(d=d, K=K, cell_in=cell_in, net_in=net_in, dfeat=dfeat, encoder=encoder)
+        self.enc.pe_start = fplace.PE_SLICE.start + n_cell_extra
         self.d = d
         # TWO readouts, because CTS targets have different SCOPE:
         #   sink-pool  (clock sinks only, mean+max)  -> cts_buffers (a clock-tree quantity)
