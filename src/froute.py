@@ -23,6 +23,13 @@ import fplace
 from fplace import (FPlace, meta, norm, set_norm as _set_norm_place, load_graph as _load_place,
                     ROOT, _slog, gnll, _z)
 
+# A/B FLAGS — mirror f_place/f_cts. Nothing here is decided by a local probe (see learning.md 4h).
+#   RT_DIRECT_KNOB: raw knobs -> deviation head. f_route had NO knob path at all (h_lvl and
+#     h_dev both read the same pooled hg, which is constant in k). f_cts's same fix: +0.505.
+#   RT_COMPOSE=sum: rt_wl = SUM_net routed_len -- an identity. f_route's pooled rt_wl scores
+#     +0.66 vs a fair 0.738 baseline, i.e. it LOSES to 3 knobs.
+RT_DIRECT_KNOB = bool(int(os.environ.get("RT_DIRECT_KNOB") or "1"))
+RT_COMPOSE     = os.environ.get("RT_COMPOSE", "pool")   # pool | sum
 RT_GLOBAL = ("rt_wl", "rt_power")            # level + knob-deviation
 RT_TIMING = ("rt_wns", "rt_tns")             # signed; level + deviation
 
@@ -83,16 +90,44 @@ class FRoute(nn.Module):
         self.enc = FPlace(d=d, K=K, encoder=encoder)     # reuse the winning encoder (no CTS feats)
         self.fc_net  = Linear(d + d, 256)                # per-net readout: [net emb, ctx]
         self.h_rt_len = Linear(256, 2)                   # per-net ROUTED LENGTH (the win)
-        self.fc_glob = Linear(4*d + d, 256)
+        self.fc_glob = Linear(4*d + d, 256)                          # LEVEL: pooled graph + ctx
+        # SEPARATE DEVIATION PATHWAY WITH A DIRECT KNOB PATH.
+        # THE BUG: h_lvl and h_dev both read the SAME hg — f_route's deviation head had NO knob
+        # path at all (worse than f_cts, which at least got them smeared through ctx). But the
+        # input graph is IDENTICAL across a design's 108 knob configs (cell_x drift EXACTLY
+        # 0.0000), so a pooled readout of it is a DESIGN FINGERPRINT, constant in k: h_dev was
+        # being asked to predict the knob response from a vector that cannot vary with the knobs.
+        # The knob response can ONLY arrive through the knob vector. f_place solved this with
+        # DIRECT_KNOB; f_cts's fix measured -0.204 -> +0.301 on buffers (same-setup A/B).
+        # Fair-split bar for f_route (fold 0, raw knobs, no OOD): rt_wl 0.738 | rt_power 0.158
+        # | rt_wns 0.135 | rt_tns 0.111 — and crit_path lifts power to 0.354, wns to 0.320.
+        self.direct_knob = RT_DIRECT_KNOB
+        kd = fplace.KNOB_DIM if self.direct_knob else 0
+        self.fc_dev  = Seq(Linear(4*d + d + kd, 256), LeakyReLU(), Linear(256, 256))
         self.h_lvl = nn.ModuleDict({k: Linear(256, 2) for k in RT_GLOBAL + RT_TIMING})
         self.h_dev = nn.ModuleDict({k: Linear(256, 2) for k in RT_GLOBAL + RT_TIMING})
 
     def forward(self, g):
         h, h_net, ctx = self.enc.encode(g)
         hn = F.leaky_relu(self.fc_net(torch.cat([h_net, ctx.expand(h_net.size(0), -1)], 1)))
-        hg = F.leaky_relu(self.fc_glob(torch.cat([
-            h.mean(0), h.max(0).values, h_net.mean(0), h_net.max(0).values, ctx])))
+        pool = [h.mean(0), h.max(0).values, h_net.mean(0), h_net.max(0).values, ctx]
+        hg = F.leaky_relu(self.fc_glob(torch.cat(pool)))             # LEVEL: which design
+        kn = [g["knobs"]] if self.direct_knob else []
+        hd = F.leaky_relu(self.fc_dev(torch.cat(pool + kn)))         # DEVIATION: + RAW knobs
         o = {"rt_len": self.h_rt_len(hn)}
         for k in RT_GLOBAL + RT_TIMING:
-            o[f"{k}_lvl"] = self.h_lvl[k](hg); o[f"{k}_dev"] = self.h_dev[k](hg)
+            o[f"{k}_lvl"] = self.h_lvl[k](hg)
+            o[f"{k}_dev"] = self.h_dev[k](hd)                        # knob response, knobs direct
+        # ANALYTIC COMPOSITION: rt_wl = SUM_net routed_len_net is an IDENTITY, not a model —
+        # the same structure as tot_hpwl = SUM_net HPWL_net, and f_route ALREADY predicts the
+        # per-net routed length (its strongest head). f_route's rt_wl knob-transfer is +0.66
+        # against a fair baseline of 0.738 — i.e. the pooled readout LOSES to 3 knobs, exactly
+        # like f_place's tot_hpwl (0.654 vs 0.702). GRANNITE's pattern (DAC'20): let the net
+        # predict the per-node unknown, let an exact formula aggregate.
+        if RT_COMPOSE == "sum":
+            nm_ = norm()
+            lg = self.h_rt_len(hn)[:, 0] * float(nm_["rt_len_s"]) + float(nm_["rt_len_m"])
+            mk = g.get("m_rt_len")
+            lg = lg[mk] if mk is not None and mk.any() else lg
+            o["rt_wl_sum"] = torch.logsumexp(lg, 0)                  # log um, supervised in train
         return o

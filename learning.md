@@ -703,6 +703,43 @@ showing no model gain at all.
 
 ---
 
+## 4i. f_route — the same two defects, one of them worse
+
+### MEASURED — f_route's FAIR baseline (cluster fold-0 split, raw knobs, no OOD)
+
+| target | raw knobs | **+crit_path** | f_route known |
+|---|---|---|---|
+| rt_wl | **0.738** | 0.747 | **+0.66 ⇒ LOSES to 3 knobs** |
+| rt_power | 0.158 | **0.354** | — |
+| rt_wns | 0.135 | **0.320** | — |
+| rt_tns | 0.111 | **0.268** | — |
+
+**rt_wl at +0.66 loses to a 0.738 baseline** — exactly f_place's tot_hpwl story (0.654 vs 0.702).
+And **crit_path matters far MORE here** than in f_place (power 0.158→0.354, wns 0.135→0.320, vs
+f_place's wns 0.091→0.118) — routing timing is dominated by the design's clock scale.
+
+### ❌ DEFECT 1 — f_route's deviation head had NO knob path at all
+```python
+o[f"{k}_lvl"] = self.h_lvl[k](hg);  o[f"{k}_dev"] = self.h_dev[k](hg)   # SAME hg!
+```
+Both heads read the same pooled `hg`. **Worse than f_cts**, which at least received knobs smeared
+through `ctx`. And since the input graph is IDENTICAL across a design's 108 configs (cell_x drift
+0.0000), a pooled readout of it is a design fingerprint **constant in k** — `h_dev` was being asked
+to predict knob response from a vector that *cannot vary with the knobs*. Fixed: separate
+`fc_dev` pathway + raw knobs (`RT_DIRECT_KNOB`). f_cts's identical fix measured −0.204 → +0.301.
+
+### ❌ DEFECT 2 — rt_wl was pooled, though the identity was sitting right there
+`rt_wl = Σ_net routed_len_net`, and f_route **already predicts per-net routed length** (its
+strongest head, LODO +0.66). Same structure as `tot_hpwl = Σ_net HPWL_net`. Fixed behind
+`RT_COMPOSE=pool|sum`, supervised via `logsumexp` + `W_RT_SUM` so per-net predictions are
+calibrated in ABSOLUTE terms (ranking alone will not sum to the right total).
+
+**The architecture principle transfers across all three stages**, which is the encouraging part:
+*GNN for per-node structure; identity/physics for composition; raw knobs direct to the deviation
+head.* All four f_route flag combos verified to build and train.
+
+---
+
 ## 5. Open questions / decisions needed
 
 1. **HYPOTHESIS (under test)**: f_cts's dev heads had **no direct knob path** — knobs reached

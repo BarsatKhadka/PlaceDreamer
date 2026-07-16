@@ -13,11 +13,17 @@ DEV = "cuda" if torch.cuda.is_available() else "cpu"
 EPOCHS=int(E("EPOCHS",200)); LR=float(E("LR",1e-3)); DIM=int(E("DIM",64)); LAYERS=int(E("LAYERS",4))
 ACCUM=int(E("ACCUM",8)); SEED=int(E("SEED",0)); ENCODER=E("ENCODER","dehnn")
 W_NET=float(E("W_NET",5)); W_DEV=float(E("W_DEV",3)); OUT=E("OUT","runs/froute")
+W_RT_SUM=float(E("W_RT_SUM",3))   # calibrates per-net routed len to the true total
 ALL=RT_GLOBAL+RT_TIMING
 torch.manual_seed(SEED); random.seed(SEED); np.random.seed(SEED); os.makedirs(OUT,exist_ok=True)
 
 def wloss(o,g):
     L = W_NET*gnll(o["rt_len"], g["y_rt_len"], g["m_rt_len"])          # per-net routed length (dense)
+    # ANALYTIC COMPOSITION: supervise rt_wl = SUM_net routed_len (RT_COMPOSE=sum).
+    # Plain MSE in log space — its job is to CALIBRATE the per-net predictions in
+    # ABSOLUTE terms so their sum reproduces the true total. Good ranking alone does not.
+    if "rt_wl_sum" in o and np.isfinite(g.get("y_rt_wl", np.nan)):
+        L = L + W_RT_SUM*(o["rt_wl_sum"] - float(g["y_rt_wl"]))**2
     for k in ALL:
         if g[f"deg_{k}"]: continue
         L=L+gnll(o[f"{k}_lvl"],g[f"y_{k}_lvl"])+W_DEV*gnll(o[f"{k}_dev"],g[f"y_{k}_dev"])
